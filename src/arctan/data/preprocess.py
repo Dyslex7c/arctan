@@ -387,8 +387,13 @@ def preprocess(config: PipelineConfig) -> TemporalSplitResult:
             pl.Series(name=col, values=scaled_matrix[:, i]).cast(pl.Float32)
         )
 
-    # 7. Build edge DataFrame
-    edges_out = edges_df.select(["src_id", "dst_id", "amount", "step"])
+    # 7. Build edge DataFrame (include txn_type and is_fraud for temporal pipeline)
+    edge_select_cols = ["src_id", "dst_id", "amount", "step"]
+    if "txn_type" in edges_df.columns:
+        edge_select_cols.append("txn_type")
+    if "is_fraud" in edges_df.columns:
+        edge_select_cols.append("is_fraud")
+    edges_out = edges_df.select(edge_select_cols)
 
     logger.info(
         "Preprocessing complete: %d nodes, %d edges, %d features.",

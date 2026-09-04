@@ -4,9 +4,9 @@
 
 Arctan is an end-to-end, production-grade **graph-based anomaly detection and AML intelligence system**. Common fraud prevention models evaluate accounts in isolation using tabular classifiers or static threshold rules. Acts such as structuring, smurfing, and account takeovers (ATO) deliberately circumvents single-account checks by dispersing capital across coordinated networks of mule accounts and rapid multi-hop payment chains.
 
-Arctan addresses this by modeling financial transactions as a dynamic, directed, attributed graph where accounts are nodes and transfers are edges carrying real-time monetary and temporal metadata. Using a hybrid **GraphSAGE + Edge-Aware GATv2** neural network, Arctan captures both macroscopic structural topology (fan-out dispersion hubs, intra-ring clustering) and microscopic edge dynamics (transfer velocity, balance depletion, payment sizes). 
+Arctan addresses this by modeling financial transactions as a dynamic, directed, attributed graph where accounts are nodes and transfers are edges carrying real-time monetary and temporal metadata. It implements two complementary architectures: a **static GraphSAGE + Edge-Aware GATv2** baseline that captures structural topology from a frozen graph snapshot, and a **Temporal Graph Network (TGN)** with **online entity memory** that processes transactions as a chronological event stream. The TGN maintains per-entity GRU-updated memory vectors that evolve as transactions arrive — capturing behavioral trajectories (e.g. an account that transitions from normal activity to burst fan-out transfers) that static models fundamentally cannot represent.
 
-Arctan is engineered to solve the pervasive problem of **future-information leakage** found in naive graph benchmarks: it uses strict **temporal (forward-time) splits** and point-in-time feature engineering, ensuring models are trained purely on historical activity and evaluated against future emerging fraud. Every prediction is paired with **GNNExplainer** feature- and neighbor-level attributions for compliance explainability, served via an asynchronous API gateway designed for low-latency production scoring.
+Arctan is engineered to solve the pervasive problem of **future-information leakage** found in naive graph benchmarks: it uses strict **temporal (forward-time) splits** and chronological event processing, ensuring models are trained purely on historical activity and evaluated against future emerging fraud. The TGN's causal message passing eliminates the subtler leakage present in transductive static GNNs, where message aggregation allows information to flow backward through future edges. Every prediction is paired with **GNNExplainer** feature- and neighbor-level attributions for compliance explainability, served via an asynchronous API gateway designed for low-latency production scoring.
 
 ---
 
@@ -161,6 +161,33 @@ In real-world fraud operations, compliance analysts have a fixed review budget. 
 | **GNNExplainer attribution** | Every entity risk score includes an interpretable attribution summary detailing the top contributing features and influential counterparty neighbours. |
 | **Polars high-throughput pipeline** | Computes graph-structural metrics, rolling volumes, and counterparty diversity at 5–10× the speed of pandas. |
 | **Decoupled microservice architecture** | Fast inference server (`:8001`) with warm singleton model loading and batch endpoints, behind an async FastAPI gateway (`:8000`) with graceful degradation fallbacks. |
+| **TGN online entity memory** | Each entity maintains a GRU-updated memory vector that evolves as transactions arrive chronologically, capturing behavioral trajectories that static GNNs cannot represent. |
+| **Causal temporal message passing** | The TGN processes events in time order, sampling only past neighbors via `LastNeighborLoader`. Memory gradients are detached across batches (standard TGN practice) to prevent intractable BPTT. |
+| **Incremental inference** | The temporal scorer can ingest new transactions and update entity memories without reprocessing the entire graph — enabling real-time risk scoring on streaming data. |
+
+---
+
+### Temporal Graph Network (TGN) Architecture
+
+The TGN processes transactions as a chronological event stream `(src, dst, t, features)` rather than a frozen graph. For each batch of events:
+
+```
+1. Retrieve memory[src] and memory[dst] (current entity states)
+2. Compute message = concat(memory_src, memory_dst, edge_features, time_encoding(Δt))
+3. Aggregate messages per node (LastAggregator: keep most recent)
+4. Update memory via GRU: memory[node] = GRU(aggregated_message, memory[node])
+5. Generate embedding via temporal graph attention (TransformerConv) over causal neighborhood
+6. Classify: MLP(memory || attention_embedding) → P(fraud)
+```
+
+| Component | Implementation | Purpose |
+|-----------|---------------|---------|
+| **Time Encoder** | `cos(W · Δt + b)` with learnable W, b | Maps elapsed time to d-dimensional embeddings (Xu et al., 2020) |
+| **Entity Memory** | PyG `TGNMemory` with GRU cell | Persistent per-node state vectors updated at each event |
+| **Message Function** | `IdentityMessage` (concatenation) | Combines source/dest memory, edge features, and time encoding |
+| **Message Aggregator** | `LastAggregator` | Keeps most recent message per node (suited for sparse interactions) |
+| **Temporal Attention** | PyG `TransformerConv` (2-head) | Multi-head attention over causal K-nearest temporal neighbors |
+| **Classifier** | 3-layer MLP with ReLU + Dropout | Maps `memory || attention_output` to binary fraud probability |
 
 ---
 
@@ -186,7 +213,8 @@ In real-world fraud operations, compliance analysts have a fixed review budget. 
 
 | Layer | Technology |
 |-------|------------|
-| Model | PyTorch, PyTorch Geometric (SAGEConv, GATv2Conv with edge attributes, GNNExplainer) |
+| Static Model | PyTorch, PyTorch Geometric (SAGEConv, GATv2Conv with edge attributes, GNNExplainer) |
+| Temporal Model | PyTorch Geometric TGN (TGNMemory, LastNeighborLoader, TransformerConv, TemporalDataLoader) |
 | Data | Polars, scikit-learn (StandardScaler), HuggingFace Hub |
 | Loss | Focal Loss with inverse-frequency class weighting |
 | Serving | FastAPI, uvicorn, httpx (async proxy gateway) |
@@ -202,15 +230,18 @@ In real-world fraud operations, compliance analysts have a fixed review budget. 
 # 1. Install dependencies
 uv sync
 
-# 2. Run the end-to-end pipeline in one command
-# Automatically downloads data, builds temporal graph, trains, and evaluates
+# 2. Run the full temporal TGN pipeline (default)
 bash run_pipeline.sh
 
+# Or run the static baseline pipeline
+bash run_pipeline.sh static
+
 # Or run individual stages:
-uv run python -m arctan.data.download       # Generate/acquire temporal transactions
-uv run python -m arctan.data.graph_builder  # Build PyG graph with temporal splits
-uv run python -m arctan.train               # Train GNN with edge-aware attention
-uv run python -m arctan.evaluate            # Generate evaluation report & PR curve
+uv run python -m arctan.data.graph_builder  # Build both static graph + temporal data
+uv run python -m arctan.temporal_train      # Train TGN with entity memory
+uv run python -m arctan.train               # Train static FraudGNN (baseline)
+uv run python -m arctan.evaluate temporal   # Evaluate temporal model
+uv run python -m arctan.evaluate static     # Evaluate static model
 
 # 3. Start services
 uv run python -m arctan.main                # ML scoring service (:8001)

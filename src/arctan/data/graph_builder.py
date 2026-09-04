@@ -1,12 +1,17 @@
-"""Converts preprocessed DataFrames into a PyTorch Geometric ``Data`` object.
+"""Converts preprocessed DataFrames into PyTorch Geometric graph objects.
 
-Key improvements over the baseline:
-  1. **Temporal masks**: train/val/test are assigned by temporal period
-     (not random permutation), preventing future-information leakage.
-  2. **Edge attribute normalization**: ``amount`` is log-transformed and
-     ``timestamp`` is min-max normalized so GATv2Conv receives meaningful
-     scaled edge features.
-  3. Persists the graph to disk for fast reload during training.
+Supports two graph representations:
+
+**Static graph** (``build_graph``):
+  • Single ``Data`` object with all edges flattened into one snapshot.
+  • Temporal masks split nodes into train/val/test by first-activity time.
+  • Used by the static FraudGNN baseline.
+
+**Temporal event stream** (``build_temporal_data``):
+  • ``TemporalData`` object with events sorted chronologically.
+  • Each event is a ``(src, dst, t, msg)`` tuple for the TGN pipeline.
+  • Preserves raw integer timestamps (time encoder learns its own representation).
+  • Used by the TemporalFraudGNN.
 """
 
 from __future__ import annotations
@@ -15,10 +20,10 @@ import logging
 
 import numpy as np
 import torch
-from torch_geometric.data import Data
+from torch_geometric.data import Data, TemporalData
 
 from arctan.config import PipelineConfig, get_default_config
-from arctan.data.preprocess import TemporalSplitResult, preprocess
+from arctan.data.preprocess import FEATURE_COLS, TemporalSplitResult, preprocess
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -159,7 +164,7 @@ def build_graph(
 
 
 def load_graph(config: PipelineConfig) -> Data:
-    """Load a previously saved graph from disk."""
+    """Load a previously saved static graph from disk."""
     graph_path = config.paths.graph_path
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph file not found at {graph_path}")
@@ -173,17 +178,153 @@ def load_graph(config: PipelineConfig) -> Data:
     return data
 
 
+# Transaction type encoding for temporal edge features
+_TXN_TYPE_MAP = {
+    "PAYMENT": 0.0,
+    "TRANSFER": 0.25,
+    "CASH_OUT": 0.5,
+    "CASH_IN": 0.75,
+    "DEBIT": 1.0,
+}
+
+
+def build_temporal_data(
+    split_result: TemporalSplitResult, config: PipelineConfig
+) -> dict:
+    """Build a TemporalData object from the preprocessed event stream.
+
+    Unlike ``build_graph`` which flattens all edges into a single static snapshot,
+    this function preserves chronological order. Each event is stored as
+    ``(src, dst, t, msg)`` where ``msg = [log(amount+1), txn_type_encoded]``.
+
+    Returns a dict with:
+      - ``temporal_data``: The PyG TemporalData object (sorted by time).
+      - ``node_labels``: Tensor of node-level fraud labels ``[N]``.
+      - ``entity_ids``: List of entity ID strings.
+      - ``train_entity_ids``, ``val_entity_ids``, ``test_entity_ids``: Entity split sets.
+      - ``num_nodes``: Total node count.
+    """
+    nodes_df = split_result.nodes_df
+    edges_df = split_result.edges_df
+
+    logger.info("Building TemporalData object for TGN pipeline...")
+
+    if edges_df.height == 0:
+        logger.warning("Empty edges DataFrame.")
+        return {}
+
+    # Sort edges chronologically (should already be sorted, but enforce it)
+    edges_sorted = edges_df.sort("step")
+
+    # Extract source, destination, timestamp
+    src = torch.tensor(
+        edges_sorted.select("src_id").to_numpy().squeeze(), dtype=torch.long
+    )
+    dst = torch.tensor(
+        edges_sorted.select("dst_id").to_numpy().squeeze(), dtype=torch.long
+    )
+    t = torch.tensor(
+        edges_sorted.select("step").to_numpy().squeeze(), dtype=torch.long
+    )
+
+    # Build edge message features: [log(amount+1), txn_type_encoded]
+    amounts = edges_sorted.select("amount").to_numpy().squeeze().astype(np.float32)
+    log_amounts = np.log1p(amounts)
+
+    if "txn_type" in edges_sorted.columns:
+        txn_types = edges_sorted.select("txn_type").to_series().to_list()
+        txn_encoded = np.array(
+            [_TXN_TYPE_MAP.get(t_type, 0.5) for t_type in txn_types],
+            dtype=np.float32,
+        )
+    else:
+        txn_encoded = np.zeros(len(log_amounts), dtype=np.float32)
+
+    msg = torch.tensor(
+        np.stack([log_amounts, txn_encoded], axis=1), dtype=torch.float32
+    )
+
+    temporal_data = TemporalData(src=src, dst=dst, t=t, msg=msg)
+
+    # Node labels
+    y_np = nodes_df.select("is_fraud").to_numpy().squeeze()
+    node_labels = torch.tensor(y_np, dtype=torch.int64)
+
+    # Structural node features (16 features from feature engineering)
+    available_cols = [c for c in FEATURE_COLS if c in nodes_df.columns]
+    if available_cols:
+        feature_np = nodes_df.select(available_cols).to_numpy().astype(np.float32)
+        node_features = torch.tensor(feature_np, dtype=torch.float32)
+    else:
+        node_features = torch.zeros(nodes_df.height, 0, dtype=torch.float32)
+
+    # Entity IDs
+    entity_ids = (
+        nodes_df.select("entity_id").to_series().to_list()
+        if "entity_id" in nodes_df.columns
+        else []
+    )
+
+    # Persist
+    config.paths.processed_dir.mkdir(parents=True, exist_ok=True)
+    out_path = config.paths.temporal_graph_path
+    result = {
+        "temporal_data": temporal_data,
+        "node_labels": node_labels,
+        "node_features": node_features,
+        "entity_ids": entity_ids,
+        "train_entity_ids": split_result.train_entity_ids,
+        "val_entity_ids": split_result.val_entity_ids,
+        "test_entity_ids": split_result.test_entity_ids,
+        "num_nodes": nodes_df.height,
+    }
+    torch.save(result, out_path)
+    logger.info(f"Saved TemporalData to {out_path}")
+
+    logger.info(
+        "TemporalData: %d events, %d nodes, msg_dim=%d, "
+        "step range=[%d, %d]",
+        len(temporal_data.src),
+        nodes_df.height,
+        msg.shape[1],
+        int(t.min()),
+        int(t.max()),
+    )
+
+    return result
+
+
+def load_temporal_data(config: PipelineConfig) -> dict:
+    """Load a previously saved TemporalData dict from disk."""
+    path = config.paths.temporal_graph_path
+    if not path.exists():
+        raise FileNotFoundError(f"Temporal data file not found at {path}")
+
+    logger.info(f"Loading TemporalData from {path}")
+    return torch.load(path, weights_only=False)
+
+
 if __name__ == "__main__":
     cfg = get_default_config()
     cfg.paths.ensure_dirs()
 
-    logger.info("Starting temporal data pipeline...")
+    logger.info("Starting data pipeline...")
     split_result = preprocess(cfg)
-    graph_data = build_graph(split_result, cfg)
 
-    logger.info("Pipeline completed successfully.")
+    # Build static graph (for baseline FraudGNN)
+    graph_data = build_graph(split_result, cfg)
     logger.info(
-        f"Graph: {graph_data.num_nodes} nodes, {graph_data.num_edges} edges, "
+        f"Static graph: {graph_data.num_nodes} nodes, {graph_data.num_edges} edges, "
         f"{graph_data.num_node_features} features, "
         f"edge_attr shape={graph_data.edge_attr.shape}"
     )
+
+    # Build temporal data (for TGN)
+    temporal_result = build_temporal_data(split_result, cfg)
+    logger.info(
+        f"Temporal data: {len(temporal_result['temporal_data'].src)} events, "
+        f"{temporal_result['num_nodes']} nodes"
+    )
+
+    logger.info("Pipeline completed successfully.")
+

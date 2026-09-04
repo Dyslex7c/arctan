@@ -39,9 +39,14 @@ class PathConfig(BaseModel):
     processed_dir: Path = Field(default_factory=lambda: _PROJECT_ROOT / "data" / "processed")
     models_dir: Path = Field(default_factory=lambda: _PROJECT_ROOT / "data" / "models")
 
-    # Final artefact file names
+    # Static model artefacts
     graph_file: str = "fraud_graph.pt"
     best_model_file: str = "fraud_gnn_best.pt"
+
+    # Temporal model artefacts
+    temporal_graph_file: str = "temporal_data.pt"
+    temporal_model_file: str = "temporal_gnn_best.pt"
+    memory_state_file: str = "entity_memory_state.pt"
 
     def ensure_dirs(self) -> None:
         """Create every configured directory if it doesn't exist."""
@@ -62,6 +67,18 @@ class PathConfig(BaseModel):
     def best_model_path(self) -> Path:
         return self.models_dir / self.best_model_file
 
+    @property
+    def temporal_graph_path(self) -> Path:
+        return self.processed_dir / self.temporal_graph_file
+
+    @property
+    def temporal_model_path(self) -> Path:
+        return self.models_dir / self.temporal_model_file
+
+    @property
+    def memory_state_path(self) -> Path:
+        return self.models_dir / self.memory_state_file
+
 
 # Model architecture
 class ModelConfig(BaseModel):
@@ -75,6 +92,26 @@ class ModelConfig(BaseModel):
     dropout: float = 0.3
     aggr: Literal["mean", "max", "add"] = "mean"
     edge_dim: int | None = 2       # edge features: [log_amount, norm_timestamp]
+
+
+# Temporal GNN architecture (TGN)
+class TemporalModelConfig(BaseModel):
+    """Architecture parameters for the Temporal Graph Network (TGN).
+
+    The TGN maintains per-entity memory vectors updated via GRU as transactions
+    arrive chronologically, enabling time-aware fraud pattern recognition.
+    """
+
+    memory_dim: int = 100          # GRU hidden state per entity
+    time_dim: int = 100            # learnable time encoding dimension
+    embedding_dim: int = 128       # final node embedding before classifier
+    num_attention_heads: int = 2   # heads in temporal graph attention
+    num_neighbors: int = 20        # K most recent neighbors per node
+    raw_msg_dim: int = 2           # edge event features: [log_amount, txn_type]
+    node_feature_dim: int = 0      # structural node features (set to 16 when available)
+    dropout: float = 0.1
+    out_dim: int = 2               # binary: legitimate / fraudulent
+    max_class_weight_ratio: float = 10.0  # cap positive class weight
 
 
 # Training
@@ -122,8 +159,10 @@ class PipelineConfig(BaseModel):
 
     paths: PathConfig = Field(default_factory=PathConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
+    temporal_model: TemporalModelConfig = Field(default_factory=TemporalModelConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
+    model_type: Literal["static", "temporal"] = "temporal"
 
 
 def get_default_config() -> PipelineConfig:
