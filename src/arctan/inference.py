@@ -84,7 +84,8 @@ class FraudScorer:
                         self.config.paths.best_model_path,
                         map_location=self.device,
                         weights_only=True,
-                    )
+                    ),
+                    strict=False,
                 )
                 logger.info("Trained model checkpoint loaded.")
             else:
@@ -140,10 +141,19 @@ class FraudScorer:
             }
 
         with torch.no_grad():
-            probs = self.model.predict_proba(
+            outputs = self.model(
                 self.graph.x, self.graph.edge_index, self.graph.edge_attr
             )
-            p_fraud = probs[node_idx, 1].item()
+            if isinstance(outputs, dict):
+                p_fraud = torch.softmax(outputs["fraud"], dim=-1)[node_idx, 1].item()
+                p_ring = (
+                    torch.softmax(outputs["ring"], dim=-1)[node_idx, 1].item()
+                    if "ring" in outputs
+                    else None
+                )
+            else:
+                p_fraud = torch.softmax(outputs, dim=-1)[node_idx, 1].item()
+                p_ring = None
 
         risk_score = int(p_fraud * 1000)
         risk_level = self._get_risk_level(risk_score)
@@ -161,7 +171,7 @@ class FraudScorer:
             except Exception as e:
                 logger.warning(f"Explanation generation failed: {e}")
 
-        return {
+        res = {
             "entity_id": entity_id,
             "risk_score": risk_score,
             "risk_level": risk_level,
@@ -169,6 +179,10 @@ class FraudScorer:
             "fraud_probability": float(p_fraud),
             "explanation": explanation,
         }
+        if p_ring is not None:
+            res["ring_probability"] = float(p_ring)
+            res["is_ring_member"] = bool(p_ring >= 0.5)
+        return res
 
     def score_batch(self, entity_ids: list[str]) -> list[dict]:
         """Score multiple entities."""
@@ -223,15 +237,19 @@ class TemporalFraudScorer:
                 self.node_to_idx[eid] = i
                 self.idx_to_node[i] = eid
 
-            # Load model
-            self.model = TemporalFraudGNN(tconfig).to(self.device)
-            self.model.load_state_dict(
-                torch.load(
-                    self.config.paths.temporal_model_path,
-                    map_location=self.device,
-                    weights_only=True,
-                )
+            # Load model checkpoint (supports both nested dict and flat state_dict)
+            checkpoint = torch.load(
+                self.config.paths.temporal_model_path,
+                map_location=self.device,
+                weights_only=True,
             )
+            if "model" in checkpoint:
+                tconfig.node_feature_dim = checkpoint.get("node_feature_dim", 0)
+                self.model = TemporalFraudGNN(tconfig).to(self.device)
+                self.model.load_state_dict(checkpoint["model"], strict=False)
+            else:
+                self.model = TemporalFraudGNN(tconfig).to(self.device)
+                self.model.load_state_dict(checkpoint, strict=False)
             self.model.eval()
             logger.info("Temporal model loaded.")
 
@@ -311,12 +329,24 @@ class TemporalFraudScorer:
                 device=self.device,
             )
 
-            logits = self.model(mem, edge_index, edge_feat)
+            outputs = self.model(mem, edge_index, edge_feat)
+            if isinstance(outputs, dict):
+                logits = outputs["fraud"]
+                ring_logits = outputs.get("ring")
+            else:
+                logits = outputs
+                ring_logits = None
+
             probs = torch.softmax(logits, dim=-1)
             p_fraud = probs[0, 1].item()
+            p_ring = (
+                torch.softmax(ring_logits, dim=-1)[0, 1].item()
+                if ring_logits is not None
+                else None
+            )
 
         risk_score = int(p_fraud * 1000)
-        return {
+        res = {
             "entity_id": entity_id,
             "risk_score": risk_score,
             "risk_level": self._get_risk_level(risk_score),
@@ -325,6 +355,10 @@ class TemporalFraudScorer:
             "model_type": "temporal",
             "explanation": "Score from TGN entity memory and temporal attention.",
         }
+        if p_ring is not None:
+            res["ring_probability"] = float(p_ring)
+            res["is_ring_member"] = bool(p_ring >= 0.5)
+        return res
 
     def ingest_transaction(
         self,

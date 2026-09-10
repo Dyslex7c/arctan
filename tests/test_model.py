@@ -17,7 +17,11 @@ class TestFraudGNN(unittest.TestCase):
         x = torch.randn(10, 8)
         edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
         out = self.model(x, edge_index)
-        self.assertEqual(out.shape, (10, 2))
+        self.assertIsInstance(out, dict)
+        self.assertIn("fraud", out)
+        self.assertIn("ring", out)
+        self.assertEqual(out["fraud"].shape, (10, 2))
+        self.assertEqual(out["ring"].shape, (10, 2))
 
     def test_predict_proba_sums_to_one(self) -> None:
         x = torch.randn(5, 8)
@@ -35,13 +39,22 @@ class TestFraudGNN(unittest.TestCase):
         edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
         edge_attr = torch.randn(4, 2)  # 4 edges, 2 features (log_amount, norm_step)
         out = model(x, edge_index, edge_attr=edge_attr)
-        self.assertEqual(out.shape, (10, 2))
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["fraud"].shape, (10, 2))
+        self.assertEqual(out["ring"].shape, (10, 2))
 
     def test_edge_dim_activates_gat(self) -> None:
         """With edge_dim=2, the GATv2Conv layer should have edge_dim set."""
         config = ModelConfig(in_features=8, hidden_dim=32, out_dim=2, edge_dim=2)
         model = FraudGNN(config)
         self.assertEqual(model.edge_dim, 2)
+
+    def test_ring_head_independent(self) -> None:
+        """Ring head should produce distinct representations from fraud head."""
+        x = torch.randn(10, 8)
+        edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+        out = self.model(x, edge_index)
+        self.assertFalse(torch.allclose(out["fraud"], out["ring"]))
 
 
 class TestFocalLoss(unittest.TestCase):

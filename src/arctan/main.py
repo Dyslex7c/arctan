@@ -49,6 +49,8 @@ class EntityScore(CamelModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     fraud_probability: float = Field(..., ge=0.0, le=1.0)
     explanation: str
+    ring_probability: float | None = None
+    is_ring_member: bool | None = None
 
 
 class BatchScoreRequest(BaseModel):

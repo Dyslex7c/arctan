@@ -19,6 +19,17 @@ Graph-structural features engineered per entity (16 total):
   • `out_high_risk_type_ratio`
   • `balance_depletion_ratio`: fraction of outgoing txns draining balance to zero
   • `max_single_txn_ratio`: largest single txn / total outgoing volume
+
+Temporal motif features (6 total):
+  • `t2_cycle_count`: temporal 2-cycle count (A→B→A within window)
+  • `t3_cycle_count`: temporal 3-cycle count (A→B→C→A within window)
+  • `fan_out_burst_count`: burst episodes sending to ≥K targets
+  • `fan_in_burst_count`: burst episodes receiving from ≥K sources
+  • `ping_pong_ratio`: fraction of reciprocated outgoing edges
+  • `temporal_clustering_coeff`: clustering among temporal neighbours
+
+Ring membership labels:
+  • `is_ring_member`: binary flag for entities in fraud ring components (≥2 members)
 """
 
 from __future__ import annotations
@@ -32,6 +43,7 @@ from sklearn.preprocessing import StandardScaler
 
 from arctan.config import PipelineConfig, get_default_config
 from arctan.data.download import download_all
+from arctan.data.motif_features import MOTIF_FEATURE_COLS, compute_motif_features
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -51,7 +63,8 @@ class TemporalSplitResult(NamedTuple):
     test_entity_ids: set[str]
 
 
-# The 16 features used for GNN input (order matters for consistency)
+# The 22 features used for GNN input (order matters for consistency)
+# Original 16 graph-structural features + 6 temporal motif features
 FEATURE_COLS = [
     "out_degree",
     "in_degree",
@@ -69,7 +82,7 @@ FEATURE_COLS = [
     "out_high_risk_type_ratio",
     "balance_depletion_ratio",
     "max_single_txn_ratio",
-]
+] + MOTIF_FEATURE_COLS
 
 
 def _load_raw_transactions(transactions_dir: Path) -> pl.DataFrame:
@@ -222,6 +235,78 @@ def preprocess(config: PipelineConfig) -> TemporalSplitResult:
         (fraud_count / max(1, all_nodes.height)) * 100,
     )
 
+    # 2.5. Ring membership labels (connected components among fraud-to-fraud edges)
+    logger.info("Computing ring membership labels...")
+    fraud_entity_set = set(
+        all_nodes.filter(pl.col("is_fraud") == 1)["entity_id"].to_list()
+    )
+    entity_to_nid = dict(
+        zip(
+            all_nodes["entity_id"].to_list(),
+            all_nodes["node_id"].to_list(),
+            strict=True,
+        )
+    )
+
+    # Union-Find for connected components
+    parent: dict[int, int] = {}
+
+    def _find(x: int) -> int:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Build connected components from fraud-to-fraud edges
+    fraud_to_fraud = raw_txns.filter(
+        pl.col("is_fraud") == 1
+    ).filter(
+        pl.col("sender").is_in(list(fraud_entity_set))
+        & pl.col("receiver").is_in(list(fraud_entity_set))
+    )
+
+    for row in fraud_to_fraud.iter_rows(named=True):
+        s_nid = entity_to_nid.get(row["sender"])
+        r_nid = entity_to_nid.get(row["receiver"])
+        if s_nid is not None and r_nid is not None:
+            _union(s_nid, r_nid)
+
+    # Count component sizes and mark ring members (components with ≥2 members)
+    component_sizes: dict[int, int] = {}
+    fraud_nids = [
+        entity_to_nid[eid] for eid in fraud_entity_set if eid in entity_to_nid
+    ]
+    for nid in fraud_nids:
+        root = _find(nid)
+        component_sizes[root] = component_sizes.get(root, 0) + 1
+
+    ring_members: set[int] = set()
+    for nid in fraud_nids:
+        root = _find(nid)
+        if component_sizes.get(root, 0) >= 2:
+            ring_members.add(nid)
+
+    # Add is_ring_member column
+    ring_labels = [
+        1 if nid in ring_members else 0
+        for nid in all_nodes["node_id"].to_list()
+    ]
+    all_nodes = all_nodes.with_columns(
+        pl.Series(name="is_ring_member", values=ring_labels).cast(pl.Int64)
+    )
+
+    ring_count = sum(ring_labels)
+    logger.info(
+        "Ring membership: %d entities in fraud rings (%.2f%%)",
+        ring_count,
+        (ring_count / max(1, all_nodes.height)) * 100,
+    )
+
     # 3. Map edges to node indices
     edges_df = raw_txns.join(
         all_nodes.select(["entity_id", "node_id"]).rename({"node_id": "src_id"}),
@@ -295,6 +380,29 @@ def preprocess(config: PipelineConfig) -> TemporalSplitResult:
 
     if "max_out_amount" in all_nodes.columns:
         all_nodes = all_nodes.drop("max_out_amount")
+
+    # 4.5. Temporal motif features (6 additional features)
+    if config.motif.enabled:
+        motif_df = compute_motif_features(edges_df, config.motif)
+        all_nodes = all_nodes.join(
+            motif_df, on="node_id", how="left",
+        )
+        # Fill any missing motif features with 0
+        for col in MOTIF_FEATURE_COLS:
+            if col in all_nodes.columns:
+                all_nodes = all_nodes.with_columns(
+                    pl.col(col).fill_null(0.0).cast(pl.Float32)
+                )
+            else:
+                all_nodes = all_nodes.with_columns(
+                    pl.lit(0.0).cast(pl.Float32).alias(col)
+                )
+    else:
+        # Add zero-valued motif columns when disabled
+        for col in MOTIF_FEATURE_COLS:
+            all_nodes = all_nodes.with_columns(
+                pl.lit(0.0).cast(pl.Float32).alias(col)
+            )
 
     # 5. Temporal entity assignment
     # Non-fraud entities: assigned by first transaction time

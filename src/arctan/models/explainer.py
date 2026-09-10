@@ -21,6 +21,21 @@ except ImportError:
     Explainer, GNNExplainer = None, None  # type: ignore[assignment,misc]
 
 
+class _FraudOnlyWrapper(torch.nn.Module):
+    """Thin wrapper that extracts fraud logits from the multi-task FraudGNN.
+    
+    GNNExplainer expects a model that returns a single tensor, but
+    FraudGNN now returns a dict.  This wrapper adapts the interface.
+    """
+    def __init__(self, model: FraudGNN) -> None:
+        super().__init__()
+        self.model = model
+    
+    def forward(self, x, edge_index, edge_attr=None) -> torch.Tensor:
+        outputs = self.model(x, edge_index, edge_attr)
+        return outputs["fraud"]
+
+
 class FraudExplainer:
     """Interpretability wrapper around a trained :class:`FraudGNN` model."""
 
@@ -42,7 +57,7 @@ class FraudExplainer:
             )
 
         self.explainer = Explainer(
-            model=self.model,
+            model=_FraudOnlyWrapper(self.model),
             algorithm=GNNExplainer(epochs=20),
             explanation_type="model",
             node_mask_type="attributes",

@@ -159,6 +159,35 @@ def train_temporal_model(config: PipelineConfig) -> TemporalFraudGNN:
         alpha=class_weights, gamma=config.training.focal_loss_gamma
     )
 
+    # Ring membership labels (for multi-task learning)
+    ring_labels = data_dict.get("ring_labels")
+    if ring_labels is not None:
+        ring_labels = ring_labels.to(device)
+    else:
+        ring_labels = torch.zeros(num_nodes, dtype=torch.long, device=device)
+
+    # Ring membership criterion
+    if config.multitask.enabled:
+        train_entity_ids_set = data_dict["train_entity_ids"]
+        ring_pos = sum(
+            1 for i, eid in enumerate(entity_ids)
+            if eid in train_entity_ids_set and ring_labels[i].item() == 1
+        )
+        ring_neg = train_entity_count - ring_pos
+        if ring_pos > 0:
+            raw_ring_ratio = ring_neg / ring_pos
+            capped_ring_ratio = min(raw_ring_ratio, tconfig.max_class_weight_ratio)
+            ring_class_weights = torch.tensor(
+                [1.0, capped_ring_ratio], dtype=torch.float32
+            ).to(device)
+        else:
+            ring_class_weights = torch.tensor([1.0, 1.0], dtype=torch.float32).to(device)
+        ring_criterion = FocalLoss(
+            alpha=ring_class_weights, gamma=config.training.focal_loss_gamma
+        )
+    else:
+        ring_criterion = None
+
     # Optimizer covers model, memory, and time encoder parameters
     optimizer = torch.optim.Adam(
         list(model.parameters())
@@ -219,12 +248,23 @@ def train_temporal_model(config: PipelineConfig) -> TemporalFraudGNN:
             nf = node_features[n_id] if node_features is not None else None
 
             # Forward pass through temporal attention + node features
-            logits = model(z, edge_index, edge_feat, node_features=nf)
+            outputs = model(z, edge_index, edge_feat, node_features=nf)
 
             # Compute loss on batch nodes
             batch_local = assoc[batch_nodes]
             batch_labels = node_labels[batch_nodes]
-            loss = criterion(logits[batch_local], batch_labels)
+            fraud_logits = outputs["fraud"]
+            loss = criterion(fraud_logits[batch_local], batch_labels)
+
+            # Multi-task: add ring classification loss
+            if ring_criterion is not None:
+                ring_logits_batch = outputs["ring"][batch_local]
+                ring_labels_batch = ring_labels[batch_nodes]
+                ring_loss = ring_criterion(ring_logits_batch, ring_labels_batch)
+                loss = (
+                    config.multitask.fraud_task_weight * loss
+                    + config.multitask.ring_task_weight * ring_loss
+                )
 
             loss.backward()
             optimizer.step()
@@ -272,10 +312,10 @@ def train_temporal_model(config: PipelineConfig) -> TemporalFraudGNN:
                 )
 
                 nf = node_features[n_id] if node_features is not None else None
-                logits = model(z, edge_index, edge_feat, node_features=nf)
+                outputs = model(z, edge_index, edge_feat, node_features=nf)
 
                 batch_local = assoc[batch_nodes]
-                probs = torch.softmax(logits[batch_local], dim=-1)[:, 1]
+                probs = torch.softmax(outputs["fraud"][batch_local], dim=-1)[:, 1]
 
                 val_preds.append(probs.cpu())
                 val_labels_list.append(node_labels[batch_nodes].cpu())

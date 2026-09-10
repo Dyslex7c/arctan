@@ -5,6 +5,8 @@ import unittest
 from arctan.config import (
     InferenceConfig,
     ModelConfig,
+    MotifConfig,
+    MultiTaskConfig,
     PathConfig,
     PipelineConfig,
     ServerSettings,
@@ -21,6 +23,8 @@ class TestPipelineConfig(unittest.TestCase):
         self.assertIsInstance(cfg.model, ModelConfig)
         self.assertIsInstance(cfg.training, TrainingConfig)
         self.assertIsInstance(cfg.inference, InferenceConfig)
+        self.assertIsInstance(cfg.motif, MotifConfig)
+        self.assertIsInstance(cfg.multitask, MultiTaskConfig)
 
     def test_paths(self) -> None:
         cfg = get_default_config()

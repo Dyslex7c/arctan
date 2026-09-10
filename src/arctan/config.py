@@ -92,6 +92,8 @@ class ModelConfig(BaseModel):
     dropout: float = 0.3
     aggr: Literal["mean", "max", "add"] = "mean"
     edge_dim: int | None = 2       # edge features: [log_amount, norm_timestamp]
+    ring_hidden_dim: int = 64      # hidden dim for ring classification head
+    ring_out_dim: int = 2          # ring membership: member / non-member
 
 
 # Temporal GNN architecture (TGN)
@@ -112,6 +114,8 @@ class TemporalModelConfig(BaseModel):
     dropout: float = 0.1
     out_dim: int = 2               # binary: legitimate / fraudulent
     max_class_weight_ratio: float = 10.0  # cap positive class weight
+    ring_hidden_dim: int = 64      # hidden dim for ring classification head
+    ring_out_dim: int = 2          # ring membership: member / non-member
 
 
 # Training
@@ -153,6 +157,32 @@ class ServerSettings(BaseSettings):
     )
 
 
+# Temporal motif feature engineering
+class MotifConfig(BaseModel):
+    """Parameters for temporal motif feature engineering.
+
+    Controls the time windows and thresholds used to detect temporal
+    structural patterns (cycles, bursts, clustering) in the transaction graph.
+    """
+
+    cycle_window: int = 48          # time steps for 2-cycle / 3-cycle detection
+    burst_window: int = 10          # time steps for fan-out / fan-in burst detection
+    burst_min_targets: int = 5      # min unique counterparties to count as burst
+    enabled: bool = True            # toggle motif features on/off
+
+
+# Multi-task learning
+class MultiTaskConfig(BaseModel):
+    """Multi-task learning settings for joint fraud + ring classification.
+
+    The total loss is: ``fraud_task_weight * L_fraud + ring_task_weight * L_ring``.
+    """
+
+    enabled: bool = True
+    fraud_task_weight: float = 0.7  # α for node-level fraud classification loss
+    ring_task_weight: float = 0.3   # β for ring membership classification loss
+
+
 # Aggregate config
 class PipelineConfig(BaseModel):
     """Top-level configuration container."""
@@ -162,6 +192,8 @@ class PipelineConfig(BaseModel):
     temporal_model: TemporalModelConfig = Field(default_factory=TemporalModelConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
+    motif: MotifConfig = Field(default_factory=MotifConfig)
+    multitask: MultiTaskConfig = Field(default_factory=MultiTaskConfig)
     model_type: Literal["static", "temporal"] = "temporal"
 
 

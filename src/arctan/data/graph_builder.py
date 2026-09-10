@@ -62,6 +62,13 @@ def build_graph(
     y_np = nodes_df.select("is_fraud").to_numpy().squeeze()
     y = torch.tensor(y_np, dtype=torch.int64)
 
+    # Ring membership labels (for multi-task learning)
+    if "is_ring_member" in nodes_df.columns:
+        ring_y_np = nodes_df.select("is_ring_member").to_numpy().squeeze()
+        ring_y = torch.tensor(ring_y_np, dtype=torch.int64)
+    else:
+        ring_y = torch.zeros(nodes_df.height, dtype=torch.int64)
+
     # Edges (edge_index)
     if edges_df.height > 0:
         src = edges_df.select("src_id").to_numpy().squeeze()
@@ -143,11 +150,21 @@ def build_graph(
             name, n_total, n_fraud, prevalence,
         )
 
+    # Log ring distribution per split
+    for name, mask in [("train", train_mask), ("val", val_mask), ("test", test_mask)]:
+        n_total = mask.sum().item()
+        n_ring = (ring_y[mask] == 1).sum().item() if n_total > 0 else 0
+        logger.info(
+            "  %s: %d ring members (%.2f%%)",
+            name, n_ring, (n_ring / max(1, n_total) * 100),
+        )
+
     data = Data(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
         y=y,
+        ring_y=ring_y,
         train_mask=train_mask,
         val_mask=val_mask,
         test_mask=test_mask,
@@ -250,6 +267,13 @@ def build_temporal_data(
     y_np = nodes_df.select("is_fraud").to_numpy().squeeze()
     node_labels = torch.tensor(y_np, dtype=torch.int64)
 
+    # Ring membership labels (for multi-task learning)
+    if "is_ring_member" in nodes_df.columns:
+        ring_np = nodes_df.select("is_ring_member").to_numpy().squeeze()
+        ring_labels = torch.tensor(ring_np, dtype=torch.int64)
+    else:
+        ring_labels = torch.zeros(nodes_df.height, dtype=torch.int64)
+
     # Structural node features (16 features from feature engineering)
     available_cols = [c for c in FEATURE_COLS if c in nodes_df.columns]
     if available_cols:
@@ -271,6 +295,7 @@ def build_temporal_data(
     result = {
         "temporal_data": temporal_data,
         "node_labels": node_labels,
+        "ring_labels": ring_labels,
         "node_features": node_features,
         "entity_ids": entity_ids,
         "train_entity_ids": split_result.train_entity_ids,

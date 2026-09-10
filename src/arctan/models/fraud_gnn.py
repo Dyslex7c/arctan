@@ -20,7 +20,7 @@ from arctan.config import ModelConfig
 
 
 class FraudGNN(nn.Module):
-    """Hybrid GraphSAGE + GATv2 model for binary node classification."""
+    """Hybrid GraphSAGE + GATv2 multi-task model for fraud and ring classification."""
 
     def __init__(self, config: ModelConfig) -> None:
         """Initialise the FraudGNN model.
@@ -62,6 +62,14 @@ class FraudGNN(nn.Module):
         # Output head
         self.lin = nn.Linear(config.hidden_dim // 2, config.out_dim)
 
+        # Ring membership classification head
+        self.ring_head = nn.Sequential(
+            nn.Linear(config.hidden_dim // 2, config.ring_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ring_hidden_dim, config.ring_out_dim),
+        )
+
         self.dropout_prob = config.dropout
 
     def forward(
@@ -69,7 +77,7 @@ class FraudGNN(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -78,7 +86,7 @@ class FraudGNN(nn.Module):
             edge_attr: Optional edge feature matrix of shape ``[E, D_e]``.
 
         Returns:
-            Raw logits of shape ``[N, out_dim]``.
+            Dictionary containing fraud logits and ring logits.
         """
         # SAGEConv Layer 1
         x = self.conv1(x, edge_index)
@@ -101,8 +109,10 @@ class FraudGNN(nn.Module):
         x = F.relu(x)
 
         # Linear classifier
-        x = self.lin(x)
-        return x
+        shared = x  # shared representation
+        fraud_logits = self.lin(shared)
+        ring_logits = self.ring_head(shared)
+        return {"fraud": fraud_logits, "ring": ring_logits}
 
     def predict_proba(
         self,
@@ -111,8 +121,8 @@ class FraudGNN(nn.Module):
         edge_attr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return class probabilities (softmax over logits)."""
-        logits = self.forward(x, edge_index, edge_attr)
-        return F.softmax(logits, dim=-1)
+        outputs = self.forward(x, edge_index, edge_attr)
+        return F.softmax(outputs["fraud"], dim=-1)
 
 
 class FocalLoss(nn.Module):

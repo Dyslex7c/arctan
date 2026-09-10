@@ -71,14 +71,22 @@ class TemporalFraudGNN(nn.Module):
             nn.Linear(config.embedding_dim // 2, config.out_dim),
         )
 
+        # Ring membership classification head (multi-task)
+        self.ring_classifier = nn.Sequential(
+            nn.Linear(classifier_input_dim, config.ring_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ring_hidden_dim, config.ring_out_dim),
+        )
+
     def forward(
         self,
         memory: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         node_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Forward pass producing per-node logits.
+    ) -> dict[str, torch.Tensor]:
+        """Forward pass producing per-node logits (multi-task).
 
         Args:
             memory: Node memory vectors of shape ``[N_batch, memory_dim]`` where
@@ -90,7 +98,7 @@ class TemporalFraudGNN(nn.Module):
             node_features: Optional structural node features ``[N_batch, node_feature_dim]``.
 
         Returns:
-            Raw logits of shape ``[N_batch, out_dim]``.
+            Dictionary containing fraud logits and ring logits.
         """
         # Temporal graph attention over causal neighborhood
         attn_out = self.attention(memory, edge_index, edge_attr)
@@ -108,9 +116,9 @@ class TemporalFraudGNN(nn.Module):
         combined = torch.cat(parts, dim=-1)
 
         # Classify
-        logits = self.classifier(combined)
-
-        return logits
+        fraud_logits = self.classifier(combined)
+        ring_logits = self.ring_classifier(combined)
+        return {"fraud": fraud_logits, "ring": ring_logits}
 
     def predict_proba(
         self,
@@ -120,5 +128,5 @@ class TemporalFraudGNN(nn.Module):
         node_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return class probabilities (softmax over logits)."""
-        logits = self.forward(memory, edge_index, edge_attr, node_features)
-        return F.softmax(logits, dim=-1)
+        outputs = self.forward(memory, edge_index, edge_attr, node_features)
+        return F.softmax(outputs["fraud"], dim=-1)

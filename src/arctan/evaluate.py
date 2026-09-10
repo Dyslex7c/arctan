@@ -159,7 +159,8 @@ def evaluate_model(config: PipelineConfig) -> dict:
     model = FraudGNN(config.model).to(device)
     if config.paths.best_model_path.exists():
         model.load_state_dict(
-            torch.load(config.paths.best_model_path, map_location=device, weights_only=True)
+            torch.load(config.paths.best_model_path, map_location=device, weights_only=True),
+            strict=False,
         )
     else:
         logger.warning("No model checkpoint found! Evaluating uninitialised model.")
@@ -168,7 +169,13 @@ def evaluate_model(config: PipelineConfig) -> dict:
 
     logger.info("Running inference on test set...")
     with torch.no_grad():
-        logits = model(graph.x, graph.edge_index, graph.edge_attr)
+        outputs = model(graph.x, graph.edge_index, graph.edge_attr)
+        if isinstance(outputs, dict):
+            logits = outputs["fraud"]
+            ring_logits = outputs.get("ring")
+        else:
+            logits = outputs
+            ring_logits = None
         test_logits = logits[graph.test_mask]
         test_y = graph.y[graph.test_mask]
 
@@ -228,6 +235,47 @@ def evaluate_model(config: PipelineConfig) -> dict:
     topk_metrics = _compute_topk_metrics(test_y, test_probs, k_values)
     metrics.update(topk_metrics)
 
+    # Ring membership metrics (multi-task learning)
+    test_ring_y = None
+    if ring_logits is not None and hasattr(graph, "ring_y") and graph.ring_y is not None:
+        test_ring_logits = ring_logits[graph.test_mask]
+        test_ring_y = graph.ring_y[graph.test_mask].cpu().numpy()
+        test_ring_probs = torch.softmax(test_ring_logits, dim=-1)[:, 1].cpu().numpy()
+        test_ring_preds = test_ring_logits.argmax(dim=-1).cpu().numpy()
+
+        ring_acc = accuracy_score(test_ring_y, test_ring_preds)
+        ring_prec, ring_rec, ring_f1, _ = precision_recall_fscore_support(
+            test_ring_y, test_ring_preds, labels=[0, 1], average=None, zero_division=0
+        )
+        if len(np.unique(test_ring_y)) >= 2:
+            try:
+                ring_auroc = float(roc_auc_score(test_ring_y, test_ring_probs))
+            except Exception:
+                ring_auroc = 0.5
+            try:
+                ring_pr_auc = float(average_precision_score(test_ring_y, test_ring_probs))
+            except Exception:
+                ring_pr_auc = 0.0
+        else:
+            ring_auroc = 1.0 if ring_acc == 1.0 else 0.5
+            ring_pr_auc = 1.0 if ring_acc == 1.0 else 0.0
+
+        ring_prevalence = float(test_ring_y.sum() / max(1, len(test_ring_y)))
+        ring_metrics = {
+            "ring_accuracy": float(ring_acc),
+            "ring_precision_class_1": float(ring_prec[1]),
+            "ring_recall_class_1": float(ring_rec[1]),
+            "ring_f1_class_1": float(ring_f1[1]),
+            "ring_auroc": ring_auroc,
+            "ring_pr_auc": ring_pr_auc,
+            "ring_test_prevalence": ring_prevalence,
+        }
+        metrics.update(ring_metrics)
+        logger.info(
+            "Ring test set: %d entities, %d ring members (%.2f%% prevalence), AUROC=%.4f",
+            len(test_ring_y), int(test_ring_y.sum()), ring_prevalence * 100, ring_auroc,
+        )
+
     # Threshold analysis
     threshold_metrics = _compute_threshold_analysis(test_y, test_probs)
     metrics.update(threshold_metrics)
@@ -251,6 +299,16 @@ def evaluate_model(config: PipelineConfig) -> dict:
                 f"({test_prevalence:.4f} prevalence)\n")
         f.write(f"AUROC:  {auroc:.4f}\n")
         f.write(f"PR-AUC: {pr_auc:.4f}\n\n")
+
+        if test_ring_y is not None and "ring_auroc" in metrics:
+            f.write("Ring-Level Detection Metrics\n\n")
+            f.write(f"Ring entities: {int(test_ring_y.sum())} "
+                    f"({metrics['ring_test_prevalence']:.4f} prevalence)\n")
+            f.write(f"Ring AUROC:     {metrics['ring_auroc']:.4f}\n")
+            f.write(f"Ring PR-AUC:    {metrics['ring_pr_auc']:.4f}\n")
+            f.write(f"Ring Precision: {metrics['ring_precision_class_1']:.4f}\n")
+            f.write(f"Ring Recall:    {metrics['ring_recall_class_1']:.4f}\n")
+            f.write(f"Ring F1:        {metrics['ring_f1_class_1']:.4f}\n\n")
 
         f.write("Operational Top-K Metrics\n\n")
         f.write(f"{'K':>6}  {'Precision@K':>12}  {'Recall@K':>10}  {'Lift@K':>8}\n")
@@ -323,6 +381,11 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
     num_nodes = data_dict["num_nodes"]
     entity_ids = data_dict["entity_ids"]
 
+    # Ring labels (for multi-task evaluation)
+    ring_labels = data_dict.get("ring_labels")
+    if ring_labels is not None:
+        ring_labels = ring_labels.to(device)
+
     # Load node features
     node_features_all = data_dict.get("node_features")
     if node_features_all is not None and node_features_all.size(1) > 0:
@@ -351,13 +414,13 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
     if "model" in checkpoint:
         tconfig.node_feature_dim = checkpoint.get("node_feature_dim", 0)
         model = TemporalFraudGNN(tconfig).to(device)
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint["model"], strict=False)
         time_encoder = TimeEncoder(tconfig.time_dim).to(device)
         if "time_encoder" in checkpoint:
             time_encoder.load_state_dict(checkpoint["time_encoder"])
     else:
         model = TemporalFraudGNN(tconfig).to(device)
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint, strict=False)
         time_encoder = TimeEncoder(tconfig.time_dim).to(device)
 
     model.eval()
@@ -376,6 +439,7 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
     # Accumulate per-node fraud predictions (keep latest per node)
     test_node_set = set(test_node_indices)
     node_latest_prob: dict[int, float] = {}
+    node_latest_ring_prob: dict[int, float] = {}
 
     # Edge feature storage (indexed by insertion order, matching training)
     total_events = len(temporal_data.src)
@@ -436,8 +500,18 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
                     )
 
                 nf = node_features_all[n_id] if node_features_all is not None else None
-                logits = model(z, edge_index, edge_feat, node_features=nf)
+                outputs = model(z, edge_index, edge_feat, node_features=nf)
+                if isinstance(outputs, dict):
+                    logits = outputs["fraud"]
+                    ring_logits = outputs.get("ring")
+                else:
+                    logits = outputs
+                    ring_logits = None
+
                 probs = torch.softmax(logits, dim=-1)
+                ring_probs = (
+                    torch.softmax(ring_logits, dim=-1) if ring_logits is not None else None
+                )
 
                 for node in batch_nodes:
                     nidx = node.item()
@@ -445,6 +519,8 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
                         local_idx = assoc[nidx].item()
                         p_fraud = probs[local_idx, 1].item()
                         node_latest_prob[nidx] = p_fraud
+                        if ring_probs is not None:
+                            node_latest_ring_prob[nidx] = ring_probs[local_idx, 1].item()
 
                         # Early detection tracking
                         if (
@@ -488,6 +564,47 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
 
     topk = _compute_topk_metrics(test_y, test_probs, [50, 100, 200, 500])
 
+    # Ring membership metrics (multi-task learning)
+    test_ring_y = None
+    if ring_labels is not None:
+        test_ring_y = ring_labels[
+            torch.tensor(test_node_indices, dtype=torch.long)
+        ].cpu().numpy()
+        test_ring_probs = np.array(
+            [node_latest_ring_prob.get(nidx, 0.5) for nidx in test_node_indices]
+        )
+        test_ring_preds = (test_ring_probs >= 0.5).astype(int)
+
+        ring_acc = accuracy_score(test_ring_y, test_ring_preds)
+        ring_prec, ring_rec, ring_f1, _ = precision_recall_fscore_support(
+            test_ring_y, test_ring_preds, labels=[0, 1], average=None, zero_division=0
+        )
+        if len(np.unique(test_ring_y)) >= 2:
+            try:
+                ring_auroc = float(roc_auc_score(test_ring_y, test_ring_probs))
+            except Exception:
+                ring_auroc = 0.5
+            try:
+                ring_pr_auc = float(average_precision_score(test_ring_y, test_ring_probs))
+            except Exception:
+                ring_pr_auc = 0.0
+        else:
+            ring_auroc = 1.0 if ring_acc == 1.0 else 0.5
+            ring_pr_auc = 1.0 if ring_acc == 1.0 else 0.0
+
+        ring_prevalence = float(test_ring_y.sum() / max(1, len(test_ring_y)))
+        ring_metrics = {
+            "ring_accuracy": float(ring_acc),
+            "ring_precision_class_1": float(ring_prec[1]),
+            "ring_recall_class_1": float(ring_rec[1]),
+            "ring_f1_class_1": float(ring_f1[1]),
+            "ring_auroc": ring_auroc,
+            "ring_pr_auc": ring_pr_auc,
+            "ring_test_prevalence": ring_prevalence,
+        }
+    else:
+        ring_metrics = {}
+
     # Early detection ratio
     fraud_test_nodes = [
         i for i in test_node_indices if node_labels[i].item() == 1
@@ -513,6 +630,7 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
         "test_fraud": int(test_y.sum()),
         **topk,
         **threshold,
+        **ring_metrics,
     }
 
     # Write report
@@ -533,6 +651,17 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
 
         f.write(f"\nAUROC:  {auroc:.4f}\n")
         f.write(f"PR-AUC: {pr_auc:.4f}\n")
+
+        if test_ring_y is not None and "ring_auroc" in ring_metrics:
+            f.write("\nRing-Level Detection Metrics\n")
+            f.write(f"Ring entities: {int(test_ring_y.sum())} "
+                    f"({ring_metrics['ring_test_prevalence'] * 100:.2f}% prevalence)\n")
+            f.write(f"Ring AUROC:     {ring_metrics['ring_auroc']:.4f}\n")
+            f.write(f"Ring PR-AUC:    {ring_metrics['ring_pr_auc']:.4f}\n")
+            f.write(f"Ring Precision: {ring_metrics['ring_precision_class_1']:.4f}\n")
+            f.write(f"Ring Recall:    {ring_metrics['ring_recall_class_1']:.4f}\n")
+            f.write(f"Ring F1:        {ring_metrics['ring_f1_class_1']:.4f}\n")
+
         f.write(f"\nEarly Detection Ratio (flagged within 3 fraud events): "
                 f"{early_detection_ratio:.2%}\n")
 

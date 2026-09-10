@@ -47,6 +47,22 @@ def train_model(config: PipelineConfig) -> FraudGNN:
 
     criterion = FocalLoss(alpha=class_weights, gamma=config.training.focal_loss_gamma)
 
+    # Ring membership criterion (for multi-task learning)
+    if config.multitask.enabled and hasattr(graph, 'ring_y'):
+        ring_y_train = graph.ring_y[graph.train_mask]
+        ring_pos = (ring_y_train == 1).sum().item()
+        ring_neg = (ring_y_train == 0).sum().item()
+        ring_total = ring_pos + ring_neg
+        if ring_total > 0 and ring_pos > 0:
+            ring_w_neg = ring_total / (2.0 * max(1, ring_neg))
+            ring_w_pos = ring_total / (2.0 * max(1, ring_pos))
+            ring_weights = torch.tensor([ring_w_neg, ring_w_pos], dtype=torch.float32).to(device)
+        else:
+            ring_weights = torch.tensor([1.0, 1.0], dtype=torch.float32).to(device)
+        ring_criterion = FocalLoss(alpha=ring_weights, gamma=config.training.focal_loss_gamma)
+    else:
+        ring_criterion = None
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.training.learning_rate,
@@ -63,11 +79,21 @@ def train_model(config: PipelineConfig) -> FraudGNN:
         model.train()
         optimizer.zero_grad()
 
-        logits = model(graph.x, graph.edge_index, graph.edge_attr)
-        train_logits = logits[graph.train_mask]
+        outputs = model(graph.x, graph.edge_index, graph.edge_attr)
+        train_logits = outputs["fraud"][graph.train_mask]
         train_y = graph.y[graph.train_mask]
 
         loss = criterion(train_logits, train_y)
+
+        # Multi-task: add ring classification loss
+        if ring_criterion is not None:
+            ring_logits = outputs["ring"][graph.train_mask]
+            ring_labels = graph.ring_y[graph.train_mask]
+            ring_loss = ring_criterion(ring_logits, ring_labels)
+            loss = (
+                config.multitask.fraud_task_weight * loss
+                + config.multitask.ring_task_weight * ring_loss
+            )
         loss.backward()
         optimizer.step()
 
@@ -76,8 +102,8 @@ def train_model(config: PipelineConfig) -> FraudGNN:
         # Validation
         model.eval()
         with torch.no_grad():
-            out = model(graph.x, graph.edge_index, graph.edge_attr)
-            val_logits = out[graph.val_mask]
+            val_outputs = model(graph.x, graph.edge_index, graph.edge_attr)
+            val_logits = val_outputs["fraud"][graph.val_mask]
             val_y = graph.y[graph.val_mask]
 
             val_loss = criterion(val_logits, val_y).item()

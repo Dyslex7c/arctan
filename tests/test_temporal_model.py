@@ -151,7 +151,7 @@ class TestTemporalGNN(unittest.TestCase):
         )
 
     def test_forward_shape(self):
-        """Forward pass should produce [N, out_dim] logits."""
+        """Forward pass should produce [N, out_dim] logits for both fraud and ring heads."""
         from arctan.models.temporal_gnn import TemporalFraudGNN
 
         model = TemporalFraudGNN(self.config)
@@ -161,8 +161,12 @@ class TestTemporalGNN(unittest.TestCase):
         edge_index = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
         edge_attr = torch.randn(3, 16 + 2)  # time_dim + raw_msg_dim
 
-        logits = model(memory, edge_index, edge_attr)
-        self.assertEqual(logits.shape, (10, 2))
+        out = model(memory, edge_index, edge_attr)
+        self.assertIsInstance(out, dict)
+        self.assertIn("fraud", out)
+        self.assertIn("ring", out)
+        self.assertEqual(out["fraud"].shape, (10, 2))
+        self.assertEqual(out["ring"].shape, (10, 2))
 
     def test_predict_proba_sums_to_one(self):
         """Softmax probabilities should sum to 1."""
@@ -192,11 +196,13 @@ class TestTemporalGNN(unittest.TestCase):
         edge_index = torch.empty((2, 0), dtype=torch.long)
         edge_attr = torch.empty((0, 18))
 
-        logits = model(memory, edge_index, edge_attr)
-        self.assertEqual(logits.shape, (5, 2))
+        out = model(memory, edge_index, edge_attr)
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["fraud"].shape, (5, 2))
+        self.assertEqual(out["ring"].shape, (5, 2))
 
     def test_gradient_flow(self):
-        """Gradients should flow through the model."""
+        """Gradients should flow through both task heads."""
         from arctan.models.temporal_gnn import TemporalFraudGNN
 
         model = TemporalFraudGNN(self.config)
@@ -206,8 +212,8 @@ class TestTemporalGNN(unittest.TestCase):
         edge_index = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
         edge_attr = torch.randn(3, 18)
 
-        logits = model(memory, edge_index, edge_attr)
-        loss = logits.sum()
+        out = model(memory, edge_index, edge_attr)
+        loss = out["fraud"].sum() + out["ring"].sum()
         loss.backward()
 
         self.assertIsNotNone(memory.grad)
@@ -250,8 +256,10 @@ class TestTemporalIntegration(unittest.TestCase):
         edge_index = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
         edge_attr = torch.randn(2, 18)
 
-        logits = model(z, edge_index, edge_attr)
-        self.assertEqual(logits.shape, (4, 2))
+        out = model(z, edge_index, edge_attr)
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["fraud"].shape, (4, 2))
+        self.assertEqual(out["ring"].shape, (4, 2))
 
 
 if __name__ == "__main__":
