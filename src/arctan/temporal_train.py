@@ -293,6 +293,7 @@ def train_temporal_model(config: PipelineConfig) -> TemporalFraudGNN:
 
         val_preds = []
         val_labels_list = []
+        val_logits_list = []
 
         with torch.no_grad():
             for batch in val_loader:
@@ -315,9 +316,11 @@ def train_temporal_model(config: PipelineConfig) -> TemporalFraudGNN:
                 outputs = model(z, edge_index, edge_feat, node_features=nf)
 
                 batch_local = assoc[batch_nodes]
-                probs = torch.softmax(outputs["fraud"][batch_local], dim=-1)[:, 1]
+                fraud_logits = outputs["fraud"][batch_local]
+                probs = torch.softmax(fraud_logits, dim=-1)[:, 1]
 
                 val_preds.append(probs.cpu())
+                val_logits_list.append(fraud_logits.detach().cpu())
                 val_labels_list.append(node_labels[batch_nodes].cpu())
 
                 # Update memory during validation (but no grad)
@@ -391,7 +394,43 @@ def train_temporal_model(config: PipelineConfig) -> TemporalFraudGNN:
             "time_encoder": best_time_encoder_state,
             "node_feature_dim": tconfig.node_feature_dim,
         }
+
+        # Fit temperature scaler on validation predictions
+        if config.calibration.enabled and val_logits_list:
+            from arctan.models.calibration import fit_temperature
+            
+            val_logits_t = torch.cat(val_logits_list, dim=0)
+            val_labels_t = torch.cat(val_labels_list, dim=0)
+            temp_scaler = fit_temperature(
+                val_logits_t, val_labels_t, config.calibration
+            )
+            save_dict["temperature"] = temp_scaler.state_dict()
+            logger.info(
+                "Temperature scaler fitted",
+                temperature=f"{temp_scaler.temperature_value:.4f}",
+            )
+
         torch.save(save_dict, config.paths.temporal_model_path)
+
+        # Save feature reference for drift detection
+        if config.drift.enabled:
+            import numpy as np
+            # Use train-period node features as reference
+            ref_path = config.paths.models_dir / "feature_reference.pt"
+            # Note: temporal model may not have node features
+            # Save what we have from the data dict
+            if 'node_features' in data_dict and data_dict['node_features'] is not None:
+                train_feats = data_dict['node_features'].numpy()
+                torch.save(
+                    {
+                        "mean": np.mean(train_feats, axis=0),
+                        "std": np.std(train_feats, axis=0),
+                        "raw": train_feats,
+                    },
+                    ref_path,
+                )
+                logger.info(f"Feature reference saved to {ref_path}")
+
         model.load_state_dict(best_model_state)
         logger.info(f"Best temporal model saved to {config.paths.temporal_model_path}")
 

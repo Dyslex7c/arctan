@@ -150,8 +150,51 @@ def train_model(config: PipelineConfig) -> FraudGNN:
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         config.paths.models_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), config.paths.best_model_path)
+
+        # Build checkpoint dict (replaces flat state_dict save)
+        save_dict: dict = {"model": model.state_dict()}
+
+        # Fit temperature scaler on validation logits
+        if config.calibration.enabled:
+            from arctan.models.calibration import fit_temperature
+
+            model.eval()
+            with torch.no_grad():
+                val_outputs = model(
+                    graph.x, graph.edge_index, graph.edge_attr
+                )
+                val_logits = val_outputs["fraud"][graph.val_mask]
+                val_labels = graph.y[graph.val_mask]
+
+            scaler = fit_temperature(
+                val_logits, val_labels, config.calibration
+            )
+            save_dict["temperature"] = scaler.state_dict()
+            logger.info(
+                "Temperature scaler fitted",
+                temperature=f"{scaler.temperature_value:.4f}",
+            )
+
+        torch.save(save_dict, config.paths.best_model_path)
         logger.info(f"Best model saved to {config.paths.best_model_path}")
+
+        # Save training feature reference for drift detection
+        if config.drift.enabled:
+            import numpy as np
+
+            train_features = (
+                graph.x[graph.train_mask].cpu().numpy()
+            )
+            ref_path = config.paths.models_dir / "feature_reference.pt"
+            torch.save(
+                {
+                    "mean": np.mean(train_features, axis=0),
+                    "std": np.std(train_features, axis=0),
+                    "raw": train_features,
+                },
+                ref_path,
+            )
+            logger.info(f"Feature reference saved to {ref_path}")
 
     return model
 
@@ -159,3 +202,4 @@ def train_model(config: PipelineConfig) -> FraudGNN:
 if __name__ == "__main__":
     config = get_default_config()
     train_model(config)
+

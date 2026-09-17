@@ -3,6 +3,8 @@
 import unittest
 
 from arctan.config import (
+    CalibrationConfig,
+    DriftConfig,
     InferenceConfig,
     ModelConfig,
     MotifConfig,
@@ -11,6 +13,7 @@ from arctan.config import (
     PipelineConfig,
     ServerSettings,
     TrainingConfig,
+    UncertaintyConfig,
     get_default_config,
 )
 
@@ -25,6 +28,9 @@ class TestPipelineConfig(unittest.TestCase):
         self.assertIsInstance(cfg.inference, InferenceConfig)
         self.assertIsInstance(cfg.motif, MotifConfig)
         self.assertIsInstance(cfg.multitask, MultiTaskConfig)
+        self.assertIsInstance(cfg.calibration, CalibrationConfig)
+        self.assertIsInstance(cfg.uncertainty, UncertaintyConfig)
+        self.assertIsInstance(cfg.drift, DriftConfig)
 
     def test_paths(self) -> None:
         cfg = get_default_config()

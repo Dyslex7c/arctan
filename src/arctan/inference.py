@@ -50,6 +50,7 @@ class FraudScorer:
         self.graph: Any = None
         self.node_to_idx: dict[str, int] = {}
         self.explainer: Any = None
+        self.temperature_scaler: Any = None
         self._is_loaded = False
 
     def _load(self) -> None:
@@ -79,14 +80,33 @@ class FraudScorer:
             logger.info("Loading model for inference...")
             self.model = FraudGNN(self.config.model).to(self.device)
             if self.config.paths.best_model_path.exists():
-                self.model.load_state_dict(
-                    torch.load(
-                        self.config.paths.best_model_path,
-                        map_location=self.device,
-                        weights_only=True,
-                    ),
-                    strict=False,
+                checkpoint = torch.load(
+                    self.config.paths.best_model_path,
+                    map_location=self.device,
+                    weights_only=True,
                 )
+                # Support both nested dict and flat state_dict
+                if isinstance(checkpoint, dict) and "model" in checkpoint:
+                    self.model.load_state_dict(
+                        checkpoint["model"], strict=False
+                    )
+                    # Load temperature scaler if present
+                    if "temperature" in checkpoint:
+                        from arctan.models.calibration import (
+                            TemperatureScaler,
+                        )
+                        self.temperature_scaler = TemperatureScaler()
+                        self.temperature_scaler.load_state_dict(
+                            checkpoint["temperature"]
+                        )
+                        logger.info(
+                            "Temperature scaler loaded (T=%.4f)",
+                            self.temperature_scaler.temperature_value,
+                        )
+                else:
+                    self.model.load_state_dict(
+                        checkpoint, strict=False
+                    )
                 logger.info("Trained model checkpoint loaded.")
             else:
                 logger.warning("No checkpoint found. Using uninitialised weights.")
@@ -145,15 +165,62 @@ class FraudScorer:
                 self.graph.x, self.graph.edge_index, self.graph.edge_attr
             )
             if isinstance(outputs, dict):
-                p_fraud = torch.softmax(outputs["fraud"], dim=-1)[node_idx, 1].item()
+                fraud_logits = outputs["fraud"]
+                # Apply temperature scaling if available
+                if self.temperature_scaler is not None:
+                    scaled = self.temperature_scaler(fraud_logits)
+                    p_fraud_cal = torch.softmax(
+                        scaled, dim=-1
+                    )[node_idx, 1].item()
+                else:
+                    p_fraud_cal = None
+                p_fraud = torch.softmax(
+                    fraud_logits, dim=-1
+                )[node_idx, 1].item()
                 p_ring = (
-                    torch.softmax(outputs["ring"], dim=-1)[node_idx, 1].item()
+                    torch.softmax(
+                        outputs["ring"], dim=-1
+                    )[node_idx, 1].item()
                     if "ring" in outputs
                     else None
                 )
             else:
-                p_fraud = torch.softmax(outputs, dim=-1)[node_idx, 1].item()
+                p_fraud = torch.softmax(
+                    outputs, dim=-1
+                )[node_idx, 1].item()
+                p_fraud_cal = None
                 p_ring = None
+
+        # MC Dropout uncertainty estimation
+        uncertainty_val = None
+        if self.config.uncertainty.enabled and self.model is not None:
+            try:
+                from arctan.models.uncertainty import mc_dropout_predict
+
+                def _forward_fn() -> torch.Tensor:
+                    out = self.model(
+                        self.graph.x,
+                        self.graph.edge_index,
+                        self.graph.edge_attr,
+                    )
+                    return out["fraud"] if isinstance(out, dict) else out
+
+                unc = mc_dropout_predict(
+                    self.model,
+                    _forward_fn,
+                    n_samples=self.config.uncertainty.mc_samples,
+                )
+                uncertainty_val = float(
+                    unc["entropy"][node_idx].item()
+                )
+            except Exception as e:
+                logger.warning(f"Uncertainty estimation failed: {e}")
+
+        confidence = (
+            max(0.0, min(1.0, 1.0 - uncertainty_val))
+            if uncertainty_val is not None
+            else 0.9
+        )
 
         risk_score = int(p_fraud * 1000)
         risk_level = self._get_risk_level(risk_score)
@@ -175,10 +242,14 @@ class FraudScorer:
             "entity_id": entity_id,
             "risk_score": risk_score,
             "risk_level": risk_level,
-            "confidence": 0.9,
+            "confidence": confidence,
             "fraud_probability": float(p_fraud),
             "explanation": explanation,
         }
+        if p_fraud_cal is not None:
+            res["calibrated_fraud_probability"] = float(p_fraud_cal)
+        if uncertainty_val is not None:
+            res["uncertainty"] = float(uncertainty_val)
         if p_ring is not None:
             res["ring_probability"] = float(p_ring)
             res["is_ring_member"] = bool(p_ring >= 0.5)
@@ -206,6 +277,7 @@ class TemporalFraudScorer:
         self.idx_to_node: dict[int, str] = {}
         self.num_nodes: int = 0
         self._memory_vectors: torch.Tensor | None = None
+        self.temperature_scaler: Any = None
         self._is_loaded = False
 
     def _load(self) -> None:
@@ -244,9 +316,26 @@ class TemporalFraudScorer:
                 weights_only=True,
             )
             if "model" in checkpoint:
-                tconfig.node_feature_dim = checkpoint.get("node_feature_dim", 0)
+                tconfig.node_feature_dim = checkpoint.get(
+                    "node_feature_dim", 0
+                )
                 self.model = TemporalFraudGNN(tconfig).to(self.device)
-                self.model.load_state_dict(checkpoint["model"], strict=False)
+                self.model.load_state_dict(
+                    checkpoint["model"], strict=False
+                )
+                # Load temperature scaler if present
+                if "temperature" in checkpoint:
+                    from arctan.models.calibration import (
+                        TemperatureScaler,
+                    )
+                    self.temperature_scaler = TemperatureScaler()
+                    self.temperature_scaler.load_state_dict(
+                        checkpoint["temperature"]
+                    )
+                    logger.info(
+                        "Temperature scaler loaded (T=%.4f)",
+                        self.temperature_scaler.temperature_value,
+                    )
             else:
                 self.model = TemporalFraudGNN(tconfig).to(self.device)
                 self.model.load_state_dict(checkpoint, strict=False)
@@ -315,14 +404,12 @@ class TemporalFraudScorer:
             }
 
         with torch.no_grad():
-            # Use the entity's memory vector directly through the classifier
-            # For single-entity scoring, we skip the attention layer and use
-            # the memory-only path (no neighborhood to attend over)
             mem = self._memory_vectors[node_idx].unsqueeze(0)
             tconfig = self.config.temporal_model
 
-            # Create a dummy self-loop edge for the attention layer
-            edge_index = torch.tensor([[0], [0]], dtype=torch.long, device=self.device)
+            edge_index = torch.tensor(
+                [[0], [0]], dtype=torch.long, device=self.device
+            )
             edge_feat = torch.zeros(
                 1,
                 tconfig.time_dim + tconfig.raw_msg_dim,
@@ -331,13 +418,22 @@ class TemporalFraudScorer:
 
             outputs = self.model(mem, edge_index, edge_feat)
             if isinstance(outputs, dict):
-                logits = outputs["fraud"]
+                fraud_logits = outputs["fraud"]
                 ring_logits = outputs.get("ring")
+                # Apply temperature scaling if available
+                if self.temperature_scaler is not None:
+                    scaled = self.temperature_scaler(fraud_logits)
+                    p_fraud_cal = torch.softmax(
+                        scaled, dim=-1
+                    )[0, 1].item()
+                else:
+                    p_fraud_cal = None
             else:
-                logits = outputs
+                fraud_logits = outputs
                 ring_logits = None
+                p_fraud_cal = None
 
-            probs = torch.softmax(logits, dim=-1)
+            probs = torch.softmax(fraud_logits, dim=-1)
             p_fraud = probs[0, 1].item()
             p_ring = (
                 torch.softmax(ring_logits, dim=-1)[0, 1].item()
@@ -345,16 +441,49 @@ class TemporalFraudScorer:
                 else None
             )
 
+        # MC Dropout uncertainty estimation
+        uncertainty_val = None
+        if self.config.uncertainty.enabled and self.model is not None:
+            try:
+                from arctan.models.uncertainty import mc_dropout_predict
+
+                def _forward_fn() -> torch.Tensor:
+                    out = self.model(mem, edge_index, edge_feat)
+                    return out["fraud"] if isinstance(out, dict) else out
+
+                unc = mc_dropout_predict(
+                    self.model,
+                    _forward_fn,
+                    n_samples=self.config.uncertainty.mc_samples,
+                )
+                uncertainty_val = float(unc["entropy"][0].item())
+            except Exception as e:
+                logger.warning(
+                    f"Uncertainty estimation failed: {e}"
+                )
+
+        confidence = (
+            max(0.0, min(1.0, 1.0 - uncertainty_val))
+            if uncertainty_val is not None
+            else 0.9
+        )
+
         risk_score = int(p_fraud * 1000)
         res = {
             "entity_id": entity_id,
             "risk_score": risk_score,
             "risk_level": self._get_risk_level(risk_score),
-            "confidence": 0.9,
+            "confidence": confidence,
             "fraud_probability": float(p_fraud),
             "model_type": "temporal",
-            "explanation": "Score from TGN entity memory and temporal attention.",
+            "explanation": (
+                "Score from TGN entity memory and temporal attention."
+            ),
         }
+        if p_fraud_cal is not None:
+            res["calibrated_fraud_probability"] = float(p_fraud_cal)
+        if uncertainty_val is not None:
+            res["uncertainty"] = float(uncertainty_val)
         if p_ring is not None:
             res["ring_probability"] = float(p_ring)
             res["is_ring_member"] = bool(p_ring >= 0.5)

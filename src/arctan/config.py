@@ -183,20 +183,72 @@ class MultiTaskConfig(BaseModel):
     ring_task_weight: float = 0.3   # β for ring membership classification loss
 
 
+# Calibration (temperature scaling)
+class CalibrationConfig(BaseModel):
+    """Temperature scaling and calibration settings.
+
+    After training, a scalar temperature T is learned on the validation set
+    so that ``softmax(logits / T)`` produces calibrated probabilities.
+    """
+
+    enabled: bool = True
+    num_bins: int = 15              # bins for ECE histogram
+    temperature_init: float = 1.5   # initial temperature value
+    temperature_lr: float = 0.01    # learning rate for T optimisation
+    temperature_epochs: int = 50    # LBFGS iterations to fit T
+
+
+# Uncertainty estimation (MC Dropout)
+class UncertaintyConfig(BaseModel):
+    """MC Dropout uncertainty estimation settings.
+
+    At inference time, T stochastic forward passes with dropout active
+    are used to estimate epistemic uncertainty (variance + entropy).
+    """
+
+    enabled: bool = True
+    mc_samples: int = 30            # number of stochastic forward passes
+    dropout_override: float | None = None  # override dropout (None = use model's)
+
+
+# Drift detection
+class DriftConfig(BaseModel):
+    """Feature and prediction drift detection settings.
+
+    Compares feature/prediction distributions between a reference (training)
+    set and an incoming batch using PSI and the two-sample KS-test.
+    """
+
+    enabled: bool = True
+    psi_threshold: float = 0.2      # PSI > 0.2 = significant drift
+    ks_alpha: float = 0.05          # KS-test significance level
+    num_bins: int = 10              # histogram bins for PSI
+
+
 # Aggregate config
 class PipelineConfig(BaseModel):
     """Top-level configuration container."""
 
     paths: PathConfig = Field(default_factory=PathConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
-    temporal_model: TemporalModelConfig = Field(default_factory=TemporalModelConfig)
+    temporal_model: TemporalModelConfig = Field(
+        default_factory=TemporalModelConfig
+    )
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     motif: MotifConfig = Field(default_factory=MotifConfig)
     multitask: MultiTaskConfig = Field(default_factory=MultiTaskConfig)
+    calibration: CalibrationConfig = Field(
+        default_factory=CalibrationConfig
+    )
+    uncertainty: UncertaintyConfig = Field(
+        default_factory=UncertaintyConfig
+    )
+    drift: DriftConfig = Field(default_factory=DriftConfig)
     model_type: Literal["static", "temporal"] = "temporal"
 
 
 def get_default_config() -> PipelineConfig:
     """Return a ``PipelineConfig`` with sensible defaults."""
     return PipelineConfig()
+

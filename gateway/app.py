@@ -50,6 +50,8 @@ class EntityScore(CamelModel):
     explanation: str
     ring_probability: float | None = None
     is_ring_member: bool | None = None
+    calibrated_fraud_probability: float | None = None
+    uncertainty: float | None = None
 
 
 class BatchScoreRequest(BaseModel):

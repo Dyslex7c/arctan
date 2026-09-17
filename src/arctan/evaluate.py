@@ -177,6 +177,7 @@ def evaluate_model(config: PipelineConfig) -> dict:
             logits = outputs
             ring_logits = None
         test_logits = logits[graph.test_mask]
+        test_logits_raw = test_logits.clone()  # keep for calibration
         test_y = graph.y[graph.test_mask]
 
     test_preds = test_logits.argmax(dim=-1).cpu().numpy()
@@ -280,6 +281,84 @@ def evaluate_model(config: PipelineConfig) -> dict:
     threshold_metrics = _compute_threshold_analysis(test_y, test_probs)
     metrics.update(threshold_metrics)
 
+    # Calibration metrics
+    from arctan.models.calibration import (
+        compute_brier_score,
+        compute_ece,
+        fit_temperature,
+        plot_reliability_diagram,
+    )
+    
+    raw_ece = compute_ece(test_probs, test_y, config.calibration.num_bins)
+    raw_brier = compute_brier_score(test_probs, test_y)
+    metrics["raw_ece"] = raw_ece
+    metrics["raw_brier_score"] = raw_brier
+    
+    # Fit temperature on validation set and calibrate test probs
+    if config.calibration.enabled:
+        val_logits_for_cal = logits[graph.val_mask]
+        val_y_for_cal = graph.y[graph.val_mask]
+        temp_scaler = fit_temperature(
+            val_logits_for_cal, val_y_for_cal, config.calibration
+        )
+        with torch.no_grad():
+            cal_test_logits = temp_scaler(test_logits_raw)
+            cal_test_probs = torch.softmax(
+                cal_test_logits, dim=-1
+            )[:, 1].cpu().numpy()
+        cal_ece = compute_ece(
+            cal_test_probs, test_y, config.calibration.num_bins
+        )
+        cal_brier = compute_brier_score(cal_test_probs, test_y)
+        metrics["calibrated_ece"] = cal_ece
+        metrics["calibrated_brier_score"] = cal_brier
+        metrics["temperature"] = temp_scaler.temperature_value
+        
+        # Save reliability diagram
+        rel_path = config.paths.processed_dir / "reliability_diagram.png"
+        plot_reliability_diagram(
+            cal_test_probs, test_y,
+            config.calibration.num_bins, str(rel_path)
+        )
+        logger.info(f"Reliability diagram saved to {rel_path}")
+
+    # Drift detection: compare train vs test feature distributions
+    if config.drift.enabled:
+        from arctan.data.preprocess import FEATURE_COLS
+        from arctan.drift import (
+            detect_feature_drift,
+            detect_prediction_drift,
+            generate_drift_report,
+        )
+        
+        train_features = graph.x[graph.train_mask].cpu().numpy()
+        test_features = graph.x[graph.test_mask].cpu().numpy()
+        
+        feature_drift = detect_feature_drift(
+            train_features, test_features, FEATURE_COLS, config.drift
+        )
+        
+        # Prediction drift: train probs vs test probs
+        with torch.no_grad():
+            train_probs_np = torch.softmax(
+                logits[graph.train_mask], dim=-1
+            )[:, 1].cpu().numpy()
+        pred_drift = detect_prediction_drift(
+            train_probs_np, test_probs, config.drift
+        )
+        
+        metrics["feature_drift_summary"] = feature_drift["summary"]
+        metrics["prediction_drift_psi"] = pred_drift["psi"]
+        metrics["prediction_drifted"] = pred_drift["drifted"]
+        
+        drift_report_path = (
+            config.paths.processed_dir / "drift_report.txt"
+        )
+        generate_drift_report(
+            feature_drift, pred_drift, str(drift_report_path)
+        )
+        logger.info(f"Drift report saved to {drift_report_path}")
+
     # Save classification report + top-K table
     cm = confusion_matrix(test_y, test_preds, labels=[0, 1])
     report = classification_report(test_y, test_preds, zero_division=0)
@@ -326,6 +405,35 @@ def evaluate_model(config: PipelineConfig) -> dict:
             "High-recall (≥95%) threshold: "
             f"{threshold_metrics['high_recall_95_threshold']:.2f}\n"
         )
+
+        # Calibration section
+        f.write("\nCalibration Metrics\n\n")
+        f.write(f"Raw ECE:          {metrics['raw_ece']:.4f}\n")
+        f.write(f"Raw Brier Score:  {metrics['raw_brier_score']:.4f}\n")
+        if 'calibrated_ece' in metrics:
+            f.write(f"Calibrated ECE:   {metrics['calibrated_ece']:.4f}\n")
+            f.write(
+                f"Calibrated Brier: "
+                f"{metrics['calibrated_brier_score']:.4f}\n"
+            )
+            f.write(
+                f"Temperature:      {metrics['temperature']:.4f}\n"
+            )
+
+        # Drift section
+        if 'feature_drift_summary' in metrics:
+            f.write("\nDrift Detection\n\n")
+            f.write(
+                f"Feature drift: {metrics['feature_drift_summary']}\n"
+            )
+            f.write(
+                f"Prediction PSI: "
+                f"{metrics['prediction_drift_psi']:.4f}\n"
+            )
+            f.write(
+                f"Prediction drifted: "
+                f"{metrics['prediction_drifted']}\n"
+            )
 
     logger.info(f"Evaluation report saved to {report_path}")
 
@@ -617,7 +725,15 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
         early_detected / max(1, len(fraud_test_nodes))
     )
 
+    # Calibration metrics for temporal model
+    from arctan.models.calibration import compute_brier_score, compute_ece
+    
+    raw_ece = compute_ece(test_probs, test_y, config.calibration.num_bins)
+    raw_brier = compute_brier_score(test_probs, test_y)
+
     metrics = {
+        "raw_ece": float(raw_ece),
+        "raw_brier_score": float(raw_brier),
         "model_type": "temporal",
         "accuracy": float(acc),
         "auroc": float(auroc),
@@ -664,6 +780,10 @@ def evaluate_temporal_model(config: PipelineConfig) -> dict:
 
         f.write(f"\nEarly Detection Ratio (flagged within 3 fraud events): "
                 f"{early_detection_ratio:.2%}\n")
+
+        f.write("\nCalibration Metrics\n\n")
+        f.write(f"Raw ECE:          {metrics.get('raw_ece', 'N/A')}\n")
+        f.write(f"Raw Brier Score:  {metrics.get('raw_brier_score', 'N/A')}\n")
 
         f.write(f"\nOptimal F1 Threshold: {threshold.get('optimal_f1_threshold', 'N/A')}\n")
         f.write(f"High-Recall (≥95%) Threshold: "
