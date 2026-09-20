@@ -1,10 +1,11 @@
 """FastAPI microservice for GNN-based entity risk scoring.
 
 Endpoints:
-  • ``GET  /healthz``                    liveness probe
-  • ``GET  /readyz``                     readiness probe (checks model artefacts)
-  • ``GET  /api/v1/scores/{entity_id}``  score a single entity
-  • ``POST /api/v1/scores/batch``        batch scoring (up to 100 entities)
+  • ``GET  /healthz``                          liveness probe
+  • ``GET  /readyz``                           readiness probe
+  • ``GET  /api/v1/scores/{entity_id}``        score a single entity
+  • ``POST /api/v1/scores/batch``              batch scoring (≤100)
+  • ``POST /api/v1/transactions/ingest``       ingest a transaction
 """
 
 from datetime import UTC, datetime
@@ -59,6 +60,15 @@ class BatchScoreRequest(BaseModel):
     """Request body for batch scoring."""
 
     entity_ids: list[str] = Field(..., min_length=1, max_length=100)
+
+
+class TransactionRequest(CamelModel):
+    """Request body for transaction ingestion."""
+
+    src_id: str
+    dst_id: str
+    amount: float = Field(..., gt=0)
+    txn_type: str = "TRANSFER"
 
 
 def create_app() -> FastAPI:
@@ -116,6 +126,35 @@ def create_app() -> FastAPI:
         scorer = get_scorer()
         results = scorer.score_batch(body.entity_ids)
         return ok([EntityScore(**r) for r in results])
+
+    @app.post(
+        "/api/v1/transactions/ingest",
+        response_model=Envelope[dict],
+        tags=["transactions"],
+        summary="Ingest a transaction to update entity memory",
+    )
+    async def ingest_transaction(
+        body: TransactionRequest,
+    ) -> Envelope[dict]:
+        scorer = get_scorer()
+        if hasattr(scorer, "ingest_transaction"):
+            scorer.ingest_transaction(
+                body.src_id,
+                body.dst_id,
+                body.amount,
+                body.txn_type,
+            )
+            return ok(
+                {"status": "ingested"},
+                message="Entity memories updated.",
+            )
+        return ok(
+            {"status": "skipped"},
+            message=(
+                "Static model does not support "
+                "live transaction ingestion."
+            ),
+        )
 
     return app
 

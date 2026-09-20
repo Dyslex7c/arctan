@@ -256,8 +256,125 @@ class FraudScorer:
         return res
 
     def score_batch(self, entity_ids: list[str]) -> list[dict]:
-        """Score multiple entities."""
-        return [self.score_entity(eid) for eid in entity_ids]
+        """Score multiple entities with a single batched forward pass.
+
+        Much faster than calling ``score_entity`` in a loop because the
+        GNN forward pass (the expensive part) runs only once.  MC Dropout
+        uncertainty is skipped in batch mode for performance.
+        """
+        self._load()
+
+        # Fallback when model isn't ready
+        if self.graph is None or not self.node_to_idx:
+            return [
+                {
+                    "entity_id": eid,
+                    "risk_score": 500,
+                    "risk_level": "high",
+                    "confidence": 0.0,
+                    "fraud_probability": 0.5,
+                    "explanation": (
+                        "Model not trained yet. "
+                        "Run the training pipeline first."
+                    ),
+                }
+                for eid in entity_ids
+            ]
+
+        # Resolve entity IDs to node indices
+        found: list[tuple[int, int, str]] = []  # (position, idx, eid)
+        not_found: list[tuple[int, str]] = []   # (position, eid)
+        for pos, eid in enumerate(entity_ids):
+            idx = self.node_to_idx.get(eid)
+            if idx is not None:
+                found.append((pos, idx, eid))
+            else:
+                not_found.append((pos, eid))
+
+        results: list[dict | None] = [None] * len(entity_ids)
+
+        # Fallback for unknown entities
+        for pos, eid in not_found:
+            results[pos] = {
+                "entity_id": eid,
+                "risk_score": 500,
+                "risk_level": "high",
+                "confidence": 0.1,
+                "fraud_probability": 0.5,
+                "explanation": (
+                    "Entity not found in graph. "
+                    "Default score assigned."
+                ),
+            }
+
+        if not found:
+            return results  # type: ignore[return-value]
+
+        # Single forward pass
+        node_indices = torch.tensor(
+            [idx for _, idx, _ in found],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model(
+                self.graph.x,
+                self.graph.edge_index,
+                self.graph.edge_attr,
+            )
+            if isinstance(outputs, dict):
+                fraud_logits = outputs["fraud"]
+                fraud_probs = torch.softmax(fraud_logits, dim=-1)
+                batch_p_fraud = fraud_probs[node_indices, 1]
+
+                if self.temperature_scaler is not None:
+                    scaled = self.temperature_scaler(fraud_logits)
+                    cal_probs = torch.softmax(scaled, dim=-1)
+                    batch_p_cal = cal_probs[node_indices, 1]
+                else:
+                    batch_p_cal = None
+
+                if "ring" in outputs:
+                    ring_probs = torch.softmax(
+                        outputs["ring"], dim=-1
+                    )
+                    batch_p_ring = ring_probs[node_indices, 1]
+                else:
+                    batch_p_ring = None
+            else:
+                fraud_probs = torch.softmax(outputs, dim=-1)
+                batch_p_fraud = fraud_probs[node_indices, 1]
+                batch_p_cal = None
+                batch_p_ring = None
+
+        # Build result dicts
+        explanation = (
+            "Score derived from GNN graph topology "
+            "and entity features."
+        )
+        for i, (pos, _idx, eid) in enumerate(found):
+            p_fraud = float(batch_p_fraud[i].item())
+            risk_score = int(p_fraud * 1000)
+            res = {
+                "entity_id": eid,
+                "risk_score": risk_score,
+                "risk_level": self._get_risk_level(risk_score),
+                "confidence": 0.9,
+                "fraud_probability": p_fraud,
+                "explanation": explanation,
+            }
+            if batch_p_cal is not None:
+                res["calibrated_fraud_probability"] = float(
+                    batch_p_cal[i].item()
+                )
+            if batch_p_ring is not None:
+                p_ring = float(batch_p_ring[i].item())
+                res["ring_probability"] = p_ring
+                res["is_ring_member"] = bool(p_ring >= 0.5)
+            results[pos] = res
+
+        return results  # type: ignore[return-value]
 
 
 class TemporalFraudScorer:
@@ -552,8 +669,132 @@ class TemporalFraudScorer:
         )
 
     def score_batch(self, entity_ids: list[str]) -> list[dict]:
-        """Score multiple entities."""
-        return [self.score_entity(eid) for eid in entity_ids]
+        """Score multiple entities with a single batched forward pass.
+
+        Stacks memory vectors for all requested entities and runs
+        them through the model at once. MC Dropout uncertainty is
+        skipped in batch mode for performance.
+        """
+        self._load()
+
+        if self.model is None or self._memory_vectors is None:
+            return [
+                {
+                    "entity_id": eid,
+                    "risk_score": 500,
+                    "risk_level": "high",
+                    "confidence": 0.0,
+                    "fraud_probability": 0.5,
+                    "model_type": "temporal",
+                    "explanation": (
+                        "Temporal model not ready. "
+                        "Run training first."
+                    ),
+                }
+                for eid in entity_ids
+            ]
+
+        # Resolve entity IDs
+        found: list[tuple[int, int, str]] = []
+        not_found: list[tuple[int, str]] = []
+        for pos, eid in enumerate(entity_ids):
+            idx = self.node_to_idx.get(eid)
+            if idx is not None:
+                found.append((pos, idx, eid))
+            else:
+                not_found.append((pos, eid))
+
+        results: list[dict | None] = [None] * len(entity_ids)
+
+        for pos, eid in not_found:
+            results[pos] = {
+                "entity_id": eid,
+                "risk_score": 500,
+                "risk_level": "high",
+                "confidence": 0.1,
+                "fraud_probability": 0.5,
+                "model_type": "temporal",
+                "explanation": (
+                    "Entity not found. Default score assigned."
+                ),
+            }
+
+        if not found:
+            return results  # type: ignore[return-value]
+
+        n = len(found)
+        tconfig = self.config.temporal_model
+
+        # Stack memory vectors for all found entities
+        mem_indices = [idx for _, idx, _ in found]
+        batch_mem = self._memory_vectors[mem_indices]  # [n, dim]
+
+        # Self-loop edges for each node in the batch
+        node_ids_t = torch.arange(
+            n, dtype=torch.long, device=self.device
+        )
+        edge_index = torch.stack(
+            [node_ids_t, node_ids_t], dim=0
+        )  # [2, n]
+        edge_feat = torch.zeros(
+            n,
+            tconfig.time_dim + tconfig.raw_msg_dim,
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model(batch_mem, edge_index, edge_feat)
+            if isinstance(outputs, dict):
+                fraud_logits = outputs["fraud"]
+                ring_logits = outputs.get("ring")
+                if self.temperature_scaler is not None:
+                    scaled = self.temperature_scaler(fraud_logits)
+                    cal_probs = torch.softmax(
+                        scaled, dim=-1
+                    )[:, 1]
+                else:
+                    cal_probs = None
+            else:
+                fraud_logits = outputs
+                ring_logits = None
+                cal_probs = None
+
+            fraud_probs = torch.softmax(
+                fraud_logits, dim=-1
+            )[:, 1]
+            ring_probs = (
+                torch.softmax(ring_logits, dim=-1)[:, 1]
+                if ring_logits is not None
+                else None
+            )
+
+        explanation = (
+            "Score from TGN entity memory "
+            "and temporal attention."
+        )
+        for i, (pos, _idx, eid) in enumerate(found):
+            p_fraud = float(fraud_probs[i].item())
+            risk_score = int(p_fraud * 1000)
+            res = {
+                "entity_id": eid,
+                "risk_score": risk_score,
+                "risk_level": self._get_risk_level(risk_score),
+                "confidence": 0.9,
+                "fraud_probability": p_fraud,
+                "model_type": "temporal",
+                "explanation": explanation,
+            }
+            if cal_probs is not None:
+                res["calibrated_fraud_probability"] = float(
+                    cal_probs[i].item()
+                )
+            if ring_probs is not None:
+                p_ring = float(ring_probs[i].item())
+                res["ring_probability"] = p_ring
+                res["is_ring_member"] = bool(p_ring >= 0.5)
+            results[pos] = res
+
+        return results  # type: ignore[return-value]
 
 
 # Module-level singletons

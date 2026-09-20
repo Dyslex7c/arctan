@@ -58,6 +58,13 @@ class BatchScoreRequest(BaseModel):
     entity_ids: list[str] = Field(..., min_length=1, max_length=100)
 
 
+class TransactionRequest(CamelModel):
+    src_id: str
+    dst_id: str
+    amount: float = Field(..., gt=0)
+    txn_type: str = "TRANSFER"
+
+
 def _fallback_score(entity_id: str, reason: str) -> EntityScore:
     return EntityScore(
         entity_id=entity_id,
@@ -161,6 +168,46 @@ def create_app() -> FastAPI:
             for eid in body.entity_ids
         ]
         return ok(fallbacks)
+
+    @app.post(
+        "/api/v1/transactions/ingest",
+        response_model=Envelope[dict],
+        tags=["transactions"],
+        summary="Ingest a transaction",
+        description="Proxies transaction ingestion to the ML service.",
+    )
+    async def ingest_transaction(
+        body: TransactionRequest,
+    ) -> Envelope[dict]:
+        url = (
+            f"{settings.ml_service_url.rstrip('/')}"
+            "/api/v1/transactions/ingest"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    url, json=body.model_dump()
+                )
+                if response.status_code == 200:
+                    res_json = response.json()
+                    data = res_json.get("data", res_json)
+                    return ok(data)
+                else:
+                    logger.warning(
+                        "ml_service_ingest_non_200",
+                        status_code=response.status_code,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "ml_service_ingest_unreachable",
+                url=url,
+                error=repr(exc),
+            )
+
+        return ok(
+            {"status": "error"},
+            message="ML service unavailable for ingestion.",
+        )
 
     return app
 

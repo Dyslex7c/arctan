@@ -68,5 +68,46 @@ class TestRiskLevelMapping(unittest.TestCase):
         self.assertEqual(FraudScorer._get_risk_level(100), "low")
 
 
+class TestTransactionIngestion(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def test_ingest_transaction(self) -> None:
+        response = self.client.post(
+            "/api/v1/transactions/ingest",
+            json={
+                "src_id": "ACC_000001",
+                "dst_id": "ACC_000002",
+                "amount": 500.0,
+                "txn_type": "TRANSFER",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertIn("status", body["data"])
+
+    def test_ingest_missing_amount(self) -> None:
+        response = self.client.post(
+            "/api/v1/transactions/ingest",
+            json={
+                "src_id": "ACC_000001",
+                "dst_id": "ACC_000002",
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_ingest_invalid_amount(self) -> None:
+        response = self.client.post(
+            "/api/v1/transactions/ingest",
+            json={
+                "src_id": "ACC_000001",
+                "dst_id": "ACC_000002",
+                "amount": -100.0,
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()
