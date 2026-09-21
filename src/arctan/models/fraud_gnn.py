@@ -157,6 +157,7 @@ class FocalLoss(nn.Module):
             Scalar loss tensor.
         """
         ce_loss = F.cross_entropy(logits, targets, reduction="none", weight=self.alpha)
-        pt = torch.exp(-ce_loss)
+        probs = F.softmax(logits, dim=-1)
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
         return focal_loss.mean()

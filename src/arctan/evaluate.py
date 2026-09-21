@@ -158,10 +158,15 @@ def evaluate_model(config: PipelineConfig) -> dict:
     logger.info("Loading model...")
     model = FraudGNN(config.model).to(device)
     if config.paths.best_model_path.exists():
-        model.load_state_dict(
-            torch.load(config.paths.best_model_path, map_location=device, weights_only=True),
-            strict=False,
+        checkpoint = torch.load(
+            config.paths.best_model_path,
+            map_location=device,
+            weights_only=True,
         )
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"], strict=False)
+        else:
+            model.load_state_dict(checkpoint, strict=False)
     else:
         logger.warning("No model checkpoint found! Evaluating uninitialised model.")
 

@@ -22,7 +22,10 @@ def compute_psi(reference: np.ndarray, current: np.ndarray, num_bins: int = 10) 
     """
     min_val = min(np.min(reference), np.min(current))
     max_val = max(np.max(reference), np.max(current))
-    
+
+    if min_val == max_val:
+        return 0.0  # constant feature — no drift
+
     bins = np.linspace(min_val, max_val, num_bins + 1)
     
     ref_counts, _ = np.histogram(reference, bins=bins)

@@ -46,7 +46,7 @@ def build_graph(
         return Data()
 
     # Node features (x)
-    exclude_cols = ["node_id", "entity_id", "is_fraud", "source"]
+    exclude_cols = ["node_id", "entity_id", "is_fraud", "is_ring_member", "source"]
     feature_cols = [col for col in nodes_df.columns if col not in exclude_cols]
 
     if feature_cols:

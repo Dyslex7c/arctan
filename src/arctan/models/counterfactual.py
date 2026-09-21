@@ -59,7 +59,7 @@ class CounterfactualExplainer:
         self.model.eval()
 
         with torch.no_grad():
-            initial_logits = self.model(graph.x, graph.edge_index)["fraud"]
+            initial_logits = self.model(graph.x, graph.edge_index, graph.edge_attr)["fraud"]
             initial_probs = F.softmax(initial_logits, dim=-1)
             original_prob = initial_probs[node_idx, 1].item()
 
@@ -84,7 +84,7 @@ class CounterfactualExplainer:
                 ], dim=0)
 
                 outputs = self.model(
-                    perturbed_x, graph.edge_index
+                    perturbed_x, graph.edge_index, graph.edge_attr
                 )
                 logits = outputs["fraud"]
 
@@ -107,7 +107,7 @@ class CounterfactualExplainer:
                         graph.x[node_idx + 1:],
                     ], dim=0)
                     check_logits = self.model(
-                        check_x, graph.edge_index
+                        check_x, graph.edge_index, graph.edge_attr
                     )["fraud"]
                     pred_class = (
                         check_logits[node_idx].argmax().item()
@@ -134,7 +134,7 @@ class CounterfactualExplainer:
                     graph.x[node_idx + 1:],
                 ], dim=0)
                 final_logits = self.model(
-                    final_x, graph.edge_index
+                    final_x, graph.edge_index, graph.edge_attr
                 )["fraud"]
                 final_probs = F.softmax(final_logits, dim=-1)
                 final_prob = final_probs[node_idx, 1].item()

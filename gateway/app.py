@@ -7,6 +7,7 @@ so upstream consumers never receive an error.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -105,7 +106,7 @@ def create_app() -> FastAPI:
         description="Proxies to the ML microservice with fallback.",
     )
     async def score_entity(entity_id: str) -> Envelope[EntityScore]:
-        url = f"{settings.ml_service_url.rstrip('/')}/api/v1/scores/{entity_id}"
+        url = f"{settings.ml_service_url.rstrip('/')}/api/v1/scores/{quote(entity_id, safe='')}"
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:

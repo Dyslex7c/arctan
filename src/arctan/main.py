@@ -111,7 +111,7 @@ def create_app() -> FastAPI:
         tags=["scores"],
         summary="Score a single entity",
     )
-    async def score_entity(entity_id: str) -> Envelope[EntityScore]:
+    def score_entity(entity_id: str) -> Envelope[EntityScore]:
         scorer = get_scorer()
         result = scorer.score_entity(entity_id)
         return ok(EntityScore(**result))
@@ -122,7 +122,7 @@ def create_app() -> FastAPI:
         tags=["scores"],
         summary="Score multiple entities in batch",
     )
-    async def score_batch(body: BatchScoreRequest) -> Envelope[list[EntityScore]]:
+    def score_batch(body: BatchScoreRequest) -> Envelope[list[EntityScore]]:
         scorer = get_scorer()
         results = scorer.score_batch(body.entity_ids)
         return ok([EntityScore(**r) for r in results])
@@ -133,7 +133,7 @@ def create_app() -> FastAPI:
         tags=["transactions"],
         summary="Ingest a transaction to update entity memory",
     )
-    async def ingest_transaction(
+    def ingest_transaction(
         body: TransactionRequest,
     ) -> Envelope[dict]:
         scorer = get_scorer()

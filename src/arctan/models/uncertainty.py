@@ -25,9 +25,9 @@ def enable_mc_dropout(model: nn.Module):
     is_training = model.training
     model.train()
     
-    # Keep BatchNorm in eval mode
+    # Keep BatchNorm in eval mode (covers nn.BatchNorm* and PyG BatchNorm)
     for m in model.modules():
-        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        if hasattr(m, "running_mean"):
             m.eval()
             
     try:
